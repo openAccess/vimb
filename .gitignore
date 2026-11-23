@@ -4,3 +4,6 @@
 *.tar.gz
 sandbox
 version.h
+src/archive/vimb-archive-proxy
+tests/archive/test-archive
+tests/archive/webkit-check

@@ -42,7 +42,7 @@ uninstall:
 	$(RM) $(DOTDESKTOPPREFIX)/vimb.desktop
 	$(RM) $(METAINFOPREFIX)/vimb.metainfo.xml
 
-clean: src.subdir-clean test-clean
+clean: src.subdir-clean src/archive.subdir-clean test-clean
 
 # Build and install vimb into a self-contained ./sandbox tree that mirrors the
 # configured PREFIX, so it can be run without a system-wide install. The sandbox
