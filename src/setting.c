@@ -175,6 +175,12 @@ void setting_init(Client *c)
     setting_add(c, "history-max-items", TYPE_INTEGER, &i, internal, 0, &vb.config.history_max);
     setting_add(c, "editor-command", TYPE_CHAR, &"x-terminal-emulator -e -vi '%s'", NULL, 0, NULL);
     setting_add(c, "strict-ssl", TYPE_BOOLEAN, &on, tls_policy, 0, NULL);
+    /* Where :archive keeps its archives; empty for <data dir>/archives. Read
+     * when an archive starts, as strict-ssl is, for whether the archiving
+     * proxy checks sites' certificates. */
+    setting_add(c, "archive-dir", TYPE_CHAR, &"", NULL, 0, NULL);
+    /* Whether archiving may reach loopback and private addresses. */
+    setting_add(c, "archive-allow-internal", TYPE_BOOLEAN, &off, NULL, 0, NULL);
     setting_add(c, "status-bar", TYPE_BOOLEAN, &on, statusbar, 0, NULL);
     i = 1000;
     setting_add(c, "timeoutlen", TYPE_INTEGER, &i, internal, 0, &c->map.timeoutlen);

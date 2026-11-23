@@ -134,10 +134,13 @@ guint archive_recorder_count(ArchiveRecorder *recorder)
     return (guint)g_atomic_int_get(&recorder->count);
 }
 
-gboolean archive_recorder_finish(ArchiveRecorder *recorder, GError **error)
+gboolean archive_recorder_finish(ArchiveRecorder *recorder, guint *written, GError **error)
 {
     g_async_queue_push(recorder->queue, &stop_marker);
     g_thread_join(recorder->thread);
+    if (written) {
+        *written = archive_recorder_count(recorder);
+    }
 
     GError *close_error = NULL;
     gboolean closed = warc_writer_close(recorder->writer, &close_error);

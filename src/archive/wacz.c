@@ -205,7 +205,14 @@ static char *data_package(GPtrArray *resources, const char *software, const char
     for (guint i = 0; i < resources->len; i++) {
         Resource *r      = g_ptr_array_index(resources, i);
         const char *base = strrchr(r->path, '/');
+        /* A Data Package resource name is lowercase letters, digits and
+         * "-._/" only (frictionless rejects anything else). */
         char *name       = g_ascii_strdown(base ? base + 1 : r->path, -1);
+        for (char *p = name; *p; p++) {
+            if (!g_ascii_isalnum(*p) && !strchr("-._/", *p)) {
+                *p = '-';
+            }
+        }
         g_string_append(p, "    {\n      \"name\": ");
         archive_json_append_string(p, name);
         g_string_append(p, ",\n      \"path\": ");

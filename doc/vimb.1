@@ -662,6 +662,45 @@ Save the current opened URI with \fItags\fP to the bookmark file.
 Removes all bookmarks for given \fIURI\fP or, if not given, the current opened
 page.
 .
+.SS Archiving
+Archiving makes a web archive of what is browsed: a WACZ file, which tools
+such as ReplayWeb.page and pywb replay.
+Everything an archiving tab loads goes through an archiving proxy within vimb
+and is recorded as it was sent, and so is everything loaded in tabs and
+popups opened from it.
+An archiving tab starts from nothing \(em no cookies, no cache, nobody signed
+in \(em so the archive holds what any visitor would be sent.
+The status bar of an archiving tab shows `[REC name]'.
+.TP
+.BI ":archive [" name ]
+.TQ
+.BI ":archive start [" name ]
+Open the current page in a new archiving tab, archiving as \fIname\fP (by
+default `Archive' and the date and time).
+.TP
+.B ":archive pause"
+.TQ
+.B ":archive resume"
+Stop recording for a while, or start again.
+While paused, pages still load, unrecorded.
+.TP
+.B ":archive stop"
+Finish the archive and save it as \fIname\fP.wacz in the directory set by
+`archive-dir'.
+Its tabs stay open, no longer recording.
+Closing the last tab of an archive, or quitting vimb, stops it as well.
+.TP
+.BI ":archive name [" name ]
+Show, or change, the name of the archive.
+.TP
+.B ":archive status"
+Show whether the archive is recording, and how many responses it holds.
+.PP
+These commands act on the archive of the current tab, or on the one archive
+being recorded.
+An archive is kept as loose files until it is saved, so that nothing is lost
+if vimb crashes: on its next start, vimb saves what it finds.
+.
 .SS Handlers
 Handlers allow specifying external scripts to handle alternative URI methods.
 .TP
@@ -1200,6 +1239,15 @@ URL should be allowed to access content from any origin.
 By default, when something is loaded in a using a file scheme URL, access to
 the local file system and arbitrary local storage is not allowed.
 .TP
+.B archive-allow-internal (bool)
+If 'on', archiving tabs may load from loopback and private network addresses.
+Off by default, so that a page can't have an archive record the services of
+the network vimb runs in.
+.TP
+.B archive-dir (string)
+Directory archives are saved to.
+If empty, $XDG_DATA_HOME/vimb[/PROFILE]/archives is used.
+.TP
 .BR caret (bool)
 Whether to enable accessibility enhanced keyboard navigation.
 .TP
@@ -1549,6 +1597,8 @@ CSS style applied to the status bar on https pages with untrusted certificate.
 .TP
 .B strict-ssl (bool)
 If 'on', vimb will not load a untrusted https site.
+For archiving tabs, it is read when the archive starts: if 'on', the archiving
+proxy checks each site's certificate, and doesn't archive a site that fails.
 .TP
 .B stylesheet (bool)
 If 'on' the user defined styles-sheet is used.
@@ -1657,6 +1707,15 @@ Holds the read it later queue filled by `qpush'.
 .I search
 This file holds the history of search queries.
 This file will not be touched if option \-\-incognito is set.
+.TP
+.I archives
+Saved archives (see `archive-dir'), and those being recorded, as
+\fIname\fP.capture directories.
+.TP
+.I archive-ca
+The certificate authority the archiving proxy signs its certificates for
+sites with.
+It is trusted only by archiving tabs.
 .PD
 .RE
 .

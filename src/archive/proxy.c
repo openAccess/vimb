@@ -54,7 +54,8 @@ struct ArchiveProxy {
     GMainContext          *owner_context;
 
     ArchiveCa             *ca;
-    ArchiveRecorder       *recorder;
+    ArchiveRecorder       *recorder;        /* under lock; NULL once finished */
+    guint                 recorded;         /* what it wrote, once finished */
     gint                  paused;
 
     GThread               *thread;          /* accepts connections */
@@ -142,6 +143,28 @@ static gboolean write_out(GIOStream *stream, const void *data, gsize len,
 {
     return g_output_stream_write_all(g_io_stream_get_output_stream(stream), data, len,
             NULL, cancellable, error);
+}
+
+/* Whether an exchange starting now is to be recorded. */
+static gboolean proxy_recording(ArchiveProxy *proxy)
+{
+    g_mutex_lock(&proxy->lock);
+    gboolean recording = proxy->recorder && !g_atomic_int_get(&proxy->paused);
+    g_mutex_unlock(&proxy->lock);
+    return recording;
+}
+
+/* Hands an exchange to the recorder -- or drops it, if recording has
+ * finished since it began. */
+static void proxy_submit(ArchiveProxy *proxy, ArchiveExchange *exchange)
+{
+    g_mutex_lock(&proxy->lock);
+    if (proxy->recorder) {
+        archive_recorder_submit(proxy->recorder, exchange);
+        exchange = NULL;
+    }
+    g_mutex_unlock(&proxy->lock);
+    archive_exchange_free(exchange);
 }
 
 static void send_error(Conn *conn, guint status, const char *reason, const char *detail)
@@ -787,7 +810,7 @@ static RelayResult relay_response(Conn *conn, const char *method, gboolean upgra
     if (switched) {
         /* The handshake is recorded now; the websocket may stay open long. */
         if (exchange && exchange->response) {
-            archive_recorder_submit(proxy->recorder, exchange);
+            proxy_submit(proxy, exchange);
             *submitted = TRUE;
         }
         if (client_ok) {
@@ -816,7 +839,7 @@ static gboolean serve_request(Conn *conn, Http1Parser *request, GByteArray *body
 {
     ArchiveProxy *proxy   = conn->proxy;
     const Http1Head *head = http1_parser_head(request);
-    gboolean recording    = proxy->recorder && !g_atomic_int_get(&proxy->paused);
+    gboolean recording    = proxy_recording(proxy);
     gboolean upgrade      = http1_head_has_token(head, "Connection", "upgrade")
         && http1_head_get(head, "Upgrade");
     GString *out          = upstream_head(request, dest->target);
@@ -872,7 +895,7 @@ static gboolean serve_request(Conn *conn, Http1Parser *request, GByteArray *body
         }
         if (exchange && exchange->response) {
             g_debug("%s %s", head->method, dest->uri);
-            archive_recorder_submit(proxy->recorder, exchange);
+            proxy_submit(proxy, exchange);
         } else {
             archive_exchange_free(exchange);
         }
@@ -1210,7 +1233,7 @@ ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **e
         proxy->start_error = NULL;
         g_thread_join(proxy->thread);
         if (proxy->recorder) {
-            archive_recorder_finish(proxy->recorder, NULL);
+            archive_recorder_finish(proxy->recorder, NULL, NULL);
         }
         proxy_free(proxy);
         return NULL;
@@ -1235,7 +1258,28 @@ void archive_proxy_set_paused(ArchiveProxy *proxy, gboolean paused)
 
 guint archive_proxy_get_recorded(ArchiveProxy *proxy)
 {
-    return proxy->recorder ? archive_recorder_count(proxy->recorder) : 0;
+    g_mutex_lock(&proxy->lock);
+    guint count = proxy->recorder ? archive_recorder_count(proxy->recorder) : proxy->recorded;
+    g_mutex_unlock(&proxy->lock);
+    return count;
+}
+
+gboolean archive_proxy_finish_recording(ArchiveProxy *proxy, GError **error)
+{
+    g_mutex_lock(&proxy->lock);
+    ArchiveRecorder *recorder = proxy->recorder;
+    proxy->recorder = NULL;
+    g_mutex_unlock(&proxy->lock);
+
+    /* No exchange reaches it now (see proxy_submit()), so it is ours to end. */
+    guint written = 0;
+    gboolean ok   = !recorder || archive_recorder_finish(recorder, &written, error);
+    if (recorder) {
+        g_mutex_lock(&proxy->lock);
+        proxy->recorded = written;
+        g_mutex_unlock(&proxy->lock);
+    }
+    return ok;
 }
 
 /* Must be called from the thread of the owner's main context, so that no
@@ -1266,7 +1310,7 @@ gboolean archive_proxy_stop(ArchiveProxy *proxy, GError **error)
     g_thread_pool_free(proxy->pool, FALSE, TRUE);
     proxy->pool = NULL;
 
-    gboolean ok = !proxy->recorder || archive_recorder_finish(proxy->recorder, error);
+    gboolean ok = archive_proxy_finish_recording(proxy, error);
     proxy_free(proxy);
     return ok;
 }

@@ -41,11 +41,13 @@
 #include "setting.h"
 #include "shortcut.h"
 #include "util.h"
+#include "archiving.h"
 #include "ext-proxy.h"
 #include "autocmd.h"
 #include "util.h"
 
 typedef enum {
+    EX_ARCHIVE,
 #ifdef FEATURE_AUTOCMD
     EX_AUTOCMD,
     EX_AUGROUP,
@@ -144,6 +146,7 @@ static VbCmdResult execute(Client *c, const ExArg *arg);
 static VbCmdResult ex_augroup(Client *c, const ExArg *arg);
 static VbCmdResult ex_autocmd(Client *c, const ExArg *arg);
 #endif
+static VbCmdResult ex_archive(Client *c, const ExArg *arg);
 static VbCmdResult ex_bookmark(Client *c, const ExArg *arg);
 static VbCmdResult ex_eval(Client *c, const ExArg *arg);
 static void on_eval_script_finished_usermessage(GObject *source_object,
@@ -189,6 +192,7 @@ static ExInfo commands[] = {
     {"autocmd",          EX_AUTOCMD,     ex_autocmd,    EX_FLAG_CMD|EX_FLAG_BANG},
     {"augroup",          EX_AUGROUP,     ex_augroup,    EX_FLAG_LHS|EX_FLAG_BANG},
 #endif
+    {"archive",          EX_ARCHIVE,     ex_archive,    EX_FLAG_RHS},
     {"bma",              EX_BMA,         ex_bookmark,   EX_FLAG_RHS},
     {"bmr",              EX_BMR,         ex_bookmark,   EX_FLAG_RHS},
     {"cmap",             EX_CMAP,        ex_map,        EX_FLAG_LHS|EX_FLAG_CMD},
@@ -859,6 +863,14 @@ static VbCmdResult ex_autocmd(Client *c, const ExArg *arg)
     return autocmd_add(c, arg->rhs->str, arg->bang) ? CMD_SUCCESS : CMD_ERROR;
 }
 #endif
+
+/**
+ * :archive -- archiving what is browsed in a tab as a WACZ (see archiving.h).
+ */
+static VbCmdResult ex_archive(Client *c, const ExArg *arg)
+{
+    return archiving_command(c, arg->rhs->str);
+}
 
 static VbCmdResult ex_bookmark(Client *c, const ExArg *arg)
 {

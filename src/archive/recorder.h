@@ -52,8 +52,9 @@ void archive_recorder_submit(ArchiveRecorder *recorder, ArchiveExchange *exchang
 /* How many exchanges have been written so far. Any thread. */
 guint archive_recorder_count(ArchiveRecorder *recorder);
 
-/* Writes what is queued, closes the file, and frees the recorder. Reports
- * the first error any write met. */
-gboolean archive_recorder_finish(ArchiveRecorder *recorder, GError **error);
+/* Writes what is queued, closes the file, and frees the recorder, giving
+ * back how many exchanges it wrote in all. Reports the first error any write
+ * met. */
+gboolean archive_recorder_finish(ArchiveRecorder *recorder, guint *written, GError **error);
 
 #endif /* end of include guard: _ARCHIVE_RECORDER_H */

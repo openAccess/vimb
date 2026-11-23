@@ -41,6 +41,7 @@
 #include "command.h"
 #include "completion.h"
 #include "ex.h"
+#include "archiving.h"
 #include "ext-proxy.h"
 #include "handler.h"
 #include "history.h"
@@ -125,7 +126,8 @@ static void spawn_new_instance(const char *uri);
 static void vimb_cleanup(void);
 #endif
 static void vimb_setup(void);
-static WebKitWebView *webview_new(Client *c, WebKitWebView *webview);
+static WebKitWebView *webview_new(Client *c, WebKitWebView *webview,
+        WebKitNetworkSession *session);
 static void on_found_text(WebKitFindController *finder, guint count, Client *c);
 static void on_failed_to_find_text(WebKitFindController *finder, Client *c);
 static gboolean on_user_message_received(WebKitWebView *webview, WebKitUserMessage *message, Client *c);
@@ -720,6 +722,11 @@ void vb_statusbar_update(Client *c)
     }
 
     status = g_string_new("");
+
+    /* show whether this tab is archiving */
+    if (archiving_status(c)) {
+        g_string_append_printf(status, "%s ", archiving_status(c));
+    }
 
     /* show the number of matches search results */
     if (c->state.search.active && c->state.search.matches) {
@@ -1763,7 +1770,11 @@ static void on_webview_load_changed(WebKitWebView *webview,
             /* save the current URI in register % */
             vb_register_add(c, '%', uri);
             /* check if tls is on and the page is trusted */
-            if (uri && g_str_has_prefix(uri, "https://")) {
+            if (uri && g_str_has_prefix(uri, "https://") && c->archive) {
+                /* WebKit sees only the archiving proxy's certificate; the
+                 * proxy checked the site's, if strict-ssl was on. */
+                set_statusbar_style(c, archiving_tls_checked(c) ? STATUS_SSL_VALID : STATUS_NORMAL);
+            } else if (uri && g_str_has_prefix(uri, "https://")) {
                 if (webkit_web_view_get_tls_info(webview, NULL, &tlsflags) && tlsflags) {
                     set_statusbar_style(c, STATUS_SSL_INVALID);
                 } else {
@@ -1796,6 +1807,9 @@ static void on_webview_load_changed(WebKitWebView *webview,
                 history_add(c, HISTORY_URL, uri, webkit_web_view_get_title(webview));
             }
             break;
+    }
+    if (c->archive) {
+        archiving_load_changed(c, event);
     }
 
     if (uri) {
@@ -1854,6 +1868,9 @@ static void on_webview_notify_title(WebKitWebView *webview, GParamSpec *pspec, C
     if (*title) {
         set_title(c, title);
     }
+    if (c->archive) {
+        archiving_title_changed(c);
+    }
 }
 
 /**
@@ -1870,6 +1887,9 @@ static void on_webview_notify_uri(WebKitWebView *webview, GParamSpec *pspec, Cli
 
     update_urlbar(c);
     g_setenv("VIMB_URI", c->state.uri, TRUE);
+    if (c->archive) {
+        archiving_uri_changed(c);
+    }
 }
 
 /**
@@ -2251,7 +2271,7 @@ static void vimb_setup(void)
 
     /* WebKitGTK 6.0: download-started signal moved from WebKitWebContext to WebKitNetworkSession */
     /* Connect once to the network session (shared across all webviews) */
-    g_signal_connect(vb.session, "download-started", G_CALLBACK(on_webctx_download_started), NULL);
+    vb_session_setup(vb.session);
 
     /* WebKitGTK 6.0: D-Bus proxy tracking removed - using WebKitUserMessage */
 
@@ -2483,7 +2503,39 @@ static void update_tab_label(Client *c)
  * @uri:     URI to load in the new tab (can be NULL).
  * @return:  The new client or NULL on error.
  */
+static Client *tab_new(Client *related, struct Archive *archive, const char *uri,
+        gboolean active);
+
 Client *vb_tab_new(Client *related, const char *uri, gboolean active)
+{
+    return tab_new(related, NULL, uri, active);
+}
+
+/**
+ * Create a new tab that archives into archive, with its own (unrelated)
+ * webview on the archive's network session, and load uri in it.
+ */
+Client *vb_tab_new_archive(struct Archive *archive, const char *uri)
+{
+    Client *c = tab_new(NULL, archive, uri, TRUE);
+    if (c && uri) {
+        webkit_web_view_load_uri(c->webview, uri);
+        set_title(c, uri);
+    }
+    return c;
+}
+
+/**
+ * Set up a network session the way vimb's own is: for archiving sessions as
+ * well as the main one.
+ */
+void vb_session_setup(WebKitNetworkSession *session)
+{
+    g_signal_connect(session, "download-started", G_CALLBACK(on_webctx_download_started), NULL);
+}
+
+static Client *tab_new(Client *related, struct Archive *archive, const char *uri,
+        gboolean active)
 {
     Client *c;
     GtkWidget *tab_label;
@@ -2504,8 +2556,16 @@ Client *vb_tab_new(Client *related, const char *uri, gboolean active)
     autocmd_init(c);
 #endif
 
+    /* A tab opened from an archiving tab archives too: as a related view, it
+     * shares that tab's network session. */
+    c->archive = archive ? archive : (related ? related->archive : NULL);
+    if (c->archive) {
+        archiving_tab_added(c);
+    }
+
     /* Create webview (related to existing if provided) */
-    c->webview = webview_new(c, related ? related->webview : NULL);
+    c->webview = webview_new(c, related ? related->webview : NULL,
+            archive ? archiving_session(archive) : NULL);
     c->finder = webkit_web_view_get_find_controller(c->webview);
     g_signal_connect(c->finder, "found-text", G_CALLBACK(on_found_text), c);
     g_signal_connect(c->finder, "failed-to-find-text", G_CALLBACK(on_failed_to_find_text), c);
@@ -2601,6 +2661,10 @@ void vb_tab_close(Client *c)
         vb_echo_force(c, MSG_ERROR, TRUE,
             "Can't close tab: there are running downloads. Use :q! to force");
         return;
+    }
+
+    if (c->archive) {
+        archiving_tab_closed(c);
     }
 
     /* Write last URL to closed file */
@@ -2847,7 +2911,8 @@ cleanup:
  * @webview:    Relates webview or NULL. If given a related webview is
  *              generated.
  */
-static WebKitWebView *webview_new(Client *c, WebKitWebView *webview)
+static WebKitWebView *webview_new(Client *c, WebKitWebView *webview,
+        WebKitNetworkSession *session)
 {
     WebKitWebView *new;
     WebKitUserContentManager *ucm;
@@ -2861,7 +2926,7 @@ static WebKitWebView *webview_new(Client *c, WebKitWebView *webview)
                     NULL));
     } else {
         new = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
-                    "network-session", vb.session,
+                    "network-session", session ? session : vb.session,
                     "user-content-manager", ucm,
                     "web-context", vb.webcontext,
                     NULL));
@@ -3287,6 +3352,9 @@ int main(int argc, char* argv[])
     c = client_new(NULL);
     client_show(NULL, c);
 
+    /* package any capture a crash left behind */
+    archiving_recover(c);
+
     /* process the --cmd if this was given */
     for (GSList *l = vb.cmdargs; l; l = l->next) {
         ex_run_string(c, l->data, false);
@@ -3304,6 +3372,7 @@ int main(int argc, char* argv[])
     main_loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(main_loop);
     g_main_loop_unref(main_loop);
+    archiving_shutdown();
 #ifdef FREE_ON_QUIT
     vimb_cleanup();
 #endif

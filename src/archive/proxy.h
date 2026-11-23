@@ -79,8 +79,14 @@ void archive_proxy_set_paused(ArchiveProxy *proxy, gboolean paused);
 /* How many exchanges have been written so far. */
 guint archive_proxy_get_recorded(ArchiveProxy *proxy);
 
-/* Stops taking connections, ends those open, finishes the WARC file, and
- * frees the proxy. */
+/* Stops recording for good -- finishing the WARC file, so that it can be
+ * packaged -- while traffic still passes. Exchanges in flight are not waited
+ * for, since some never end (an event stream); they go unrecorded. */
+gboolean archive_proxy_finish_recording(ArchiveProxy *proxy, GError **error);
+
+/* Stops taking connections, ends those open, finishes the WARC file (if
+ * archive_proxy_finish_recording() hasn't), and frees the proxy. Call it
+ * from the thread of the owner's main context. */
 gboolean archive_proxy_stop(ArchiveProxy *proxy, GError **error);
 
 #endif /* end of include guard: _ARCHIVE_PROXY_H */

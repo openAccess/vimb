@@ -1,25 +1,33 @@
 include ../config.mk
 
 OBJ = $(patsubst %.c, %.o, $(wildcard *.c))
+ARCHIVE_LIB = archive/libvimbarchive.a
 JSFILES  = $(wildcard scripts/*.js)
 CSSFILES = $(wildcard scripts/*.css)
 
 all: vimb webextension.subdir-all
 
-clean: webextension.subdir-clean
+clean: webextension.subdir-clean archive.subdir-clean
 	$(RM) vimb vimb.so $(OBJ)
 	$(RM) scripts/scripts.h
 
-vimb: $(OBJ)
+vimb: $(OBJ) $(ARCHIVE_LIB)
 	@echo "${CC} $@"
-	$(Q)$(CC) $(OBJ) $(LDFLAGS) -o $@
+	$(Q)$(CC) $(OBJ) $(ARCHIVE_LIB) $(LDFLAGS) -o $@
 
-vimb.so: $(OBJ)
-	$(Q)$(CC) -shared $(OBJ) $(LDFLAGS) -o $@
+vimb.so: $(OBJ) $(ARCHIVE_LIB)
+	$(Q)$(CC) -shared $(OBJ) $(ARCHIVE_LIB) $(LDFLAGS) -o $@
+
+# The archiving module builds with its own flags (see archive/Makefile).
+$(ARCHIVE_LIB): archive-lib
+archive-lib:
+	$(Q)$(MAKE) -C archive libvimbarchive.a
 
 $(OBJ): config.h ../config.mk
 
 main.o: ../version.h
+
+archiving.o: ../version.h $(wildcard archive/*.h)
 
 input.o: scripts/scripts.h
 
@@ -50,4 +58,4 @@ config.h:
 
 -include $(OBJ:.o=.d)
 
-.PHONY: all clean
+.PHONY: all clean archive-lib

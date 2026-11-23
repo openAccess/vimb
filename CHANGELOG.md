@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+* Archiving: `:archive [name]` records what is browsed in a new tab, and
+  `:archive stop` saves it as a WACZ web archive, which ReplayWeb.page and
+  pywb can replay. Responses are recorded exactly as sites sent them, by a
+  recording proxy within vimb (`src/archive/`). Also `:archive pause`,
+  `resume`, `name` and `status`, and the settings `archive-dir` and
+  `archive-allow-internal`. Archives cut off by a crash are saved on the next
+  start.
+
 ## Changed
 * Use webkit's built-in user-agent as default for setting `user-agent`
 

@@ -238,6 +238,7 @@ struct Statusbar {
 };
 
 struct AuGroup;
+struct Archive;
 
 struct Client {
     struct Client       *next;
@@ -249,6 +250,7 @@ struct Client {
     GtkWidget           *window, *input;
     GtkWidget           *tab_box;               /* the vbox containing webview+statusbar for this tab */
     WebKitWebView       *webview;
+    struct Archive      *archive;               /* what this tab archives into, or NULL */
     WebKitFindController *finder;
     WebKitWebInspector  *inspector;
     guint64             page_id;                /* page id of the webview */
@@ -345,6 +347,8 @@ void vb_gui_style_update(Client *c, const char *name, const char *value);
 
 /* Tab management functions */
 Client *vb_tab_new(Client *related, const char *uri, gboolean active);
+Client *vb_tab_new_archive(struct Archive *archive, const char *uri);
+void vb_session_setup(WebKitNetworkSession *session);
 void vb_tab_close(Client *c);
 void vb_tab_next(void);
 void vb_tab_prev(void);
