@@ -528,9 +528,13 @@ static gboolean ensure_backend(Client *c)
     GError *error = NULL;
     if (!name || !*name || !strcmp(name, "claude")) {
         A.backend = backend_claude_new(&config, &events, NULL, &error);
+    } else if (!strcmp(name, "gemini")) {
+        A.backend = backend_gemini_new(&config, &events, NULL, &error);
+    } else if (!strcmp(name, "pi")) {
+        A.backend = backend_pi_new(&config, &events, NULL, &error);
     } else {
         g_set_error(&error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                "there is no assistant '%s' (there is claude)", name);
+                "there is no assistant '%s' (there are claude, gemini and pi)", name);
     }
     json_node_unref(tools);
     if (!A.backend) {

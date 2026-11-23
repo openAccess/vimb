@@ -27,9 +27,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   and crawl; `--mcp-allow-eval` adds running JavaScript, and
   `--mcp-allow-domains` limits the sites that may be opened.
   `contrib/python/vimb.py` drives it from Python with nothing else installed.
-* Assistant: `:ask TEXT` asks an AI model (Claude, by default
-  claude-opus-5-5, with `ANTHROPIC_API_KEY`) to browse and archive with the
-  same tools, answering in a pane beside the tabs; `:assistant` shows, hides,
+* Assistant: `:ask TEXT` asks an AI model -- Claude (`ANTHROPIC_API_KEY`),
+  Gemini (`GEMINI_API_KEY`) or Pi with the user's own set-up -- to browse and
+  archive with the same tools, answering in a pane beside the tabs; `:assistant` shows, hides,
   stops and clears it. It opens only URLs that came from the user or from
   pages. Settings `assistant`, `assistant-model` and `assistant-effort`.
   `--assistant-task TEXT` runs one task headless and quits.

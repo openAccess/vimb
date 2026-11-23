@@ -75,6 +75,10 @@ struct Backend {
 
 Backend *backend_claude_new(const BackendConfig *config, const BackendEvents *events,
         gpointer data, GError **error);
+Backend *backend_gemini_new(const BackendConfig *config, const BackendEvents *events,
+        gpointer data, GError **error);
+Backend *backend_pi_new(const BackendConfig *config, const BackendEvents *events,
+        gpointer data, GError **error);
 
 void backend_tool_call_free(BackendToolCall *call);
 void backend_tool_result_free(BackendToolResult *result);
