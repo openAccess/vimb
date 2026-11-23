@@ -1084,6 +1084,221 @@ static void test_wacz(void)
     g_free(dir);
 }
 
+/* ---- replay ------------------------------------------------------------ */
+
+static void write_at(WarcWriter *writer, const char *dir, const char *uri, const char *request,
+        const char *response, int day, int hour)
+{
+    Spool *req  = spool_new(dir, 65536);
+    Spool *resp = spool_new(dir, 65536);
+    char *id;
+    GDateTime *when = g_date_time_new_utc(2026, 1, day, hour, 0, 0);
+    spool_append(req, request, strlen(request), NULL);
+    spool_append(resp, response, strlen(response), NULL);
+    WarcRecordInfo r = {.type = "response", .target_uri = uri, .date = when,
+        .content_type = "application/http;msgtype=response"};
+    g_assert_true(warc_writer_write(writer, &r, resp, &id, NULL, NULL, NULL));
+    WarcRecordInfo q = {.type = "request", .target_uri = uri, .concurrent_to = id, .date = when,
+        .content_type = "application/http;msgtype=request"};
+    g_assert_true(warc_writer_write(writer, &q, req, NULL, NULL, NULL, NULL));
+    g_date_time_unref(when);
+    g_free(id);
+    spool_free(req);
+    spool_free(resp);
+}
+
+#define PAGE_GET(path) "GET " path " HTTP/1.1\r\nHost: www.example.org\r\nSec-Fetch-Dest: document\r\n\r\n"
+#define SUB_GET(path)  "GET " path " HTTP/1.1\r\nHost: www.example.org\r\nSec-Fetch-Dest: style\r\n\r\n"
+
+static void append_body(const guint8 *data, gsize len, gpointer user)
+{
+    g_byte_array_append(user, data, len);
+}
+
+/* Asks the replay, as a browser would, and gives back the whole answer. */
+static char *ask(ArchiveReplay *replay, const char *url, const char *request_text,
+        gboolean *found)
+{
+    Http1Parser *p = http1_parser_new(HTTP1_REQUEST, 65536);
+    GByteArray *body = g_byte_array_new();
+    http1_parser_set_payload_func(p, append_body, body);
+    g_assert_cmpint(http1_parser_feed(p, (const guint8 *)request_text, strlen(request_text),
+                NULL), >, 0);
+    g_assert_true(http1_parser_is_done(p));
+    const Http1Head *head = http1_parser_head(p);
+    ArchiveReplayRequest r = {.method = head->method, .url = url, .head = head,
+        .body = body->data, .body_len = body->len};
+    gboolean f;
+    GBytes *answer = archive_replay_answer(replay, &r, &f);
+    gsize size;
+    const char *data = g_bytes_get_data(answer, &size);
+    char *text = g_strndup(data, size);
+    g_bytes_unref(answer);
+    g_byte_array_unref(body);
+    http1_parser_free(p);
+    if (found) {
+        *found = f;
+    }
+    return text;
+}
+
+static const char *body_of(const char *answer)
+{
+    const char *sep = strstr(answer, "\r\n\r\n");
+    return sep ? sep + 4 : "";
+}
+
+static void test_replay(void)
+{
+    char *dir     = make_temp_dir();
+    char *capture = g_build_filename(dir, "capture", NULL);
+    char *wacz    = g_build_filename(dir, "replay.wacz", NULL);
+    GError *error = NULL;
+    g_mkdir(capture, 0700);
+
+    char *warc = g_build_filename(capture, "data.warc.gz", NULL);
+    WarcWriter *w = warc_writer_open(warc, "test", NULL);
+    /* the page: turned away on the 1st, let in on the 2nd, again on the 3rd */
+    write_at(w, capture, "https://www.example.org/", PAGE_GET("/"),
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\n\r\nrefused", 1, 12);
+    write_at(w, capture, "https://www.example.org/", PAGE_GET("/"),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\n"
+            "Connection: keep-alive\r\n\r\nlet in", 2, 12);
+    write_at(w, capture, "https://www.example.org/", PAGE_GET("/"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nlater", 3, 12);
+    /* its stylesheet, at two moments */
+    write_at(w, capture, "https://www.example.org/s.css", SUB_GET("/s.css"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nfar", 1, 0);
+    write_at(w, capture, "https://www.example.org/s.css", SUB_GET("/s.css"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnear", 2, 13);
+    /* a video: part of it nearer, all of it later */
+    write_at(w, capture, "https://www.example.org/v.mp4", SUB_GET("/v.mp4"),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1/10\r\nContent-Length: 2\r\n"
+            "\r\n01", 2, 12);
+    write_at(w, capture, "https://www.example.org/v.mp4", SUB_GET("/v.mp4"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789", 3, 12);
+    /* chunked, as it came */
+    write_at(w, capture, "https://www.example.org/chunked", SUB_GET("/chunked"),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nStrict-Transport-Security: max-age=9"
+            "\r\n\r\n4\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n", 2, 12);
+    /* two searches, told apart by what they sent */
+    write_at(w, capture, "https://www.example.org/search",
+            "POST /search HTTP/1.1\r\nHost: www.example.org\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\nq=a+cat",
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ncats", 2, 12);
+    write_at(w, capture, "https://www.example.org/search",
+            "POST /search HTTP/1.1\r\nHost: www.example.org\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\nq=a+dog",
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndogs", 2, 12);
+    g_assert_true(warc_writer_close(w, NULL));
+
+    char *pages = g_build_filename(capture, ARCHIVE_PAGES_FILE, NULL);
+    char *line  = archive_page_line("https://www.example.org/", "2026-01-02T12:00:00Z", "Home");
+    char *text  = g_strdup_printf("%s\n%s\n", ARCHIVE_PAGES_HEADER, line);
+    g_file_set_contents(pages, text, -1, NULL);
+    g_free(text);
+    g_free(line);
+    g_assert_true(archive_wacz_package(capture, wacz, "test", "Replayed", TRUE, &error));
+    g_assert_no_error(error);
+
+    ArchiveReplay *replay = archive_replay_open(wacz, &error);
+    g_assert_no_error(error);
+    g_assert_cmpstr(archive_replay_title(replay), ==, "Replayed");
+    g_assert_cmpuint(archive_replay_pages(replay)->len, ==, 1);
+
+    gboolean found;
+    /* the page at its own moment, the 2nd: let in, not the refusal before it */
+    char *a = ask(replay, "https://www.example.org/", PAGE_GET("/"), &found);
+    g_assert_true(found);
+    g_assert_true(g_str_has_prefix(a, "HTTP/1.1 200 OK\r\n"));
+    g_assert_cmpstr(body_of(a), ==, "let in");
+    g_assert_nonnull(strstr(a, "Content-Length: 6\r\n"));
+    g_assert_nonnull(strstr(a, "Memento-Datetime: Fri, 02 Jan 2026 12:00:00 GMT\r\n"));
+    g_assert_null(strstr(a, "Connection:"));
+    g_free(a);
+
+    /* what the page loads, nearest the page's moment */
+    a = ask(replay, "https://www.example.org/s.css", "GET /s.css HTTP/1.1\r\nHost: www.example.org"
+            "\r\nReferer: https://www.example.org/\r\nSec-Fetch-Dest: style\r\n\r\n", &found);
+    g_assert_cmpstr(body_of(a), ==, "near");
+    g_free(a);
+
+    /* all of a resource, though part of it is nearer; and a range of it */
+    a = ask(replay, "https://www.example.org/v.mp4", SUB_GET("/v.mp4"), &found);
+    g_assert_true(g_str_has_prefix(a, "HTTP/1.1 200 OK\r\n"));
+    g_assert_cmpstr(body_of(a), ==, "0123456789");
+    g_free(a);
+    a = ask(replay, "https://www.example.org/v.mp4", "GET /v.mp4 HTTP/1.1\r\nHost: www.example.org"
+            "\r\nRange: bytes=2-5\r\n\r\n", &found);
+    g_assert_true(g_str_has_prefix(a, "HTTP/1.1 206 Partial Content\r\n"));
+    g_assert_nonnull(strstr(a, "Content-Range: bytes 2-5/10\r\n"));
+    g_assert_cmpstr(body_of(a), ==, "2345");
+    g_free(a);
+
+    /* a HEAD the capture never made: a GET's headers, and no body */
+    a = ask(replay, "https://www.example.org/v.mp4", "HEAD /v.mp4 HTTP/1.1\r\nHost: x\r\n\r\n",
+            &found);
+    g_assert_true(found);
+    g_assert_nonnull(strstr(a, "Content-Length: 10\r\n"));
+    g_assert_cmpstr(body_of(a), ==, "");
+    g_free(a);
+
+    /* chunked coding taken off; nothing to send the browser elsewhere */
+    a = ask(replay, "https://www.example.org/chunked", SUB_GET("/chunked"), &found);
+    g_assert_cmpstr(body_of(a), ==, "wikipedia");
+    g_assert_nonnull(strstr(a, "Content-Length: 9\r\n"));
+    g_assert_null(strstr(a, "Transfer-Encoding"));
+    g_assert_null(strstr(a, "Strict-Transport-Security"));
+    g_free(a);
+
+    /* a POST found by what it sent */
+    a = ask(replay, "https://www.example.org/search", "POST /search HTTP/1.1\r\nHost: x\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\nq=a+dog",
+            &found);
+    g_assert_cmpstr(body_of(a), ==, "dogs");
+    g_free(a);
+
+    /* misses, and why */
+    a = ask(replay, "https://www.example.org/none", PAGE_GET("/none"), &found);
+    g_assert_false(found);
+    g_assert_true(g_str_has_prefix(a, "HTTP/1.1 404 Not Found\r\n"));
+    g_assert_nonnull(strstr(a, "X-Archive-Missing: Nothing was archived at this address."));
+    g_assert_nonnull(strstr(a, "<h1>Not in the archive</h1>"));
+    g_free(a);
+    a = ask(replay, "https://other.example/", PAGE_GET("/"), &found);
+    g_assert_nonnull(strstr(a, "from this site"));
+    g_free(a);
+    a = ask(replay, "https://www.example.org/s.css?v=2", SUB_GET("/s.css?v=2"), &found);
+    g_assert_false(found);
+    g_assert_nonnull(strstr(a, "not with this query"));
+    g_assert_null(strstr(a, "<h1>"));       /* not a page: no page saying so */
+    g_free(a);
+
+    /* replay's own list of what the archive holds */
+    a = ask(replay, ARCHIVE_REPLAY_HOME, PAGE_GET("/"), &found);
+    g_assert_true(found);
+    g_assert_nonnull(strstr(a, "<a href=\"https://www.example.org/\">Home</a>"));
+    g_free(a);
+
+    guint served, missed;
+    archive_replay_counts(replay, &served, &missed);
+    g_assert_cmpuint(served, ==, 7);
+    g_assert_cmpuint(missed, ==, 3);
+    archive_replay_free(replay);
+
+    /* what isn't a WACZ, or has no index */
+    g_assert_null(archive_replay_open(warc, &error));
+    g_assert_nonnull(error);
+    g_clear_error(&error);
+
+    remove_tree(dir);
+    g_free(pages);
+    g_free(warc);
+    g_free(wacz);
+    g_free(capture);
+    g_free(dir);
+}
+
 int main(int argc, char *argv[])
 {
     g_test_init(&argc, &argv, NULL);
@@ -1101,6 +1316,7 @@ int main(int argc, char *argv[])
     g_test_add_func("/archive/netcheck/internal", test_internal_addresses);
     g_test_add_func("/archive/proxy/records-as-received", test_proxy_records_as_received);
     g_test_add_func("/archive/surt", test_surt);
+    g_test_add_func("/archive/replay", test_replay);
     g_test_add_func("/archive/request-key", test_request_key);
     g_test_add_func("/archive/index", test_index);
     g_test_add_func("/archive/zip", test_zip);

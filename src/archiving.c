@@ -46,6 +46,7 @@ typedef enum {
     ARCHIVE_PAUSED,
     ARCHIVE_SAVING,     /* being packaged */
     ARCHIVE_DONE,       /* packaged, or failed to be; tabs may remain */
+    ARCHIVE_REPLAYING,  /* not an archive being made: one being replayed */
 } ArchiveState;
 
 struct Archive {
@@ -67,6 +68,8 @@ struct Archive {
     GError               *error;        /* why it wasn't */
     guint                holds;         /* scripts keeping it, tabs or not */
     GSList               *waiters;      /* of SavedWaiter, told once it's saved */
+    ArchiveReplay        *replay;       /* what is replayed, when it is */
+    char                 *replay_path;
 };
 
 typedef struct {
@@ -214,6 +217,7 @@ static void update_status(struct Archive *a)
         case ARCHIVE_PAUSED:    label = "PAUSED"; break;
         case ARCHIVE_SAVING:    label = "SAVING"; break;
         case ARCHIVE_DONE:      label = NULL;     break;
+        case ARCHIVE_REPLAYING: label = "REPLAY"; break;
     }
     g_clear_pointer(&a->status, g_free);
     if (label) {
@@ -366,6 +370,8 @@ static void archive_free(struct Archive *a)
     if (a->proxy) {
         archive_proxy_stop(a->proxy, NULL);
     }
+    g_clear_pointer(&a->replay, archive_replay_free);     /* after the proxy, which used it */
+    g_free(a->replay_path);
     g_clear_object(&a->session);
     if (a->pages) {
         fclose(a->pages);
@@ -520,6 +526,25 @@ static void apply_cookie_policy(WebKitNetworkSession *session, const char *polic
 
 /* verify and allow_internal are -1 to follow the settings strict-ssl and
  * archive-allow-internal. */
+/* Starting from nothing: an ephemeral session, through the proxy. TLS
+ * errors fail -- the proxy's certificates are accepted host by host, as it
+ * hands them out, and nothing else is. */
+static void make_session(struct Archive *a, Client *c)
+{
+    a->session = webkit_network_session_new_ephemeral();
+    char *proxy_uri = g_strdup_printf("http://127.0.0.1:%u", archive_proxy_get_port(a->proxy));
+    WebKitNetworkProxySettings *settings = webkit_network_proxy_settings_new(proxy_uri, NULL);
+    webkit_network_session_set_proxy_settings(a->session, WEBKIT_NETWORK_PROXY_MODE_CUSTOM,
+            settings);
+    webkit_network_proxy_settings_free(settings);
+    g_free(proxy_uri);
+    webkit_network_session_set_tls_errors_policy(a->session, WEBKIT_TLS_ERRORS_POLICY_FAIL);
+    webkit_network_session_set_itp_enabled(a->session,
+            GET_BOOL(c, "intelligent-tracking-prevention"));
+    apply_cookie_policy(a->session, GET_CHAR(c, "cookie-accept"));
+    vb_session_setup(a->session);
+}
+
 static struct Archive *archive_start(Client *c, const char *name, int verify,
         int allow_internal, GError **error)
 {
@@ -580,22 +605,7 @@ static struct Archive *archive_start(Client *c, const char *name, int verify,
         goto fail;
     }
 
-    /* Starting from nothing: an ephemeral session, through the proxy. TLS
-     * errors fail -- the proxy's certificates are accepted host by host, as
-     * it hands them out, and nothing else is. */
-    a->session = webkit_network_session_new_ephemeral();
-    char *proxy_uri = g_strdup_printf("http://127.0.0.1:%u", archive_proxy_get_port(a->proxy));
-    WebKitNetworkProxySettings *settings = webkit_network_proxy_settings_new(proxy_uri, NULL);
-    webkit_network_session_set_proxy_settings(a->session, WEBKIT_NETWORK_PROXY_MODE_CUSTOM,
-            settings);
-    webkit_network_proxy_settings_free(settings);
-    g_free(proxy_uri);
-    webkit_network_session_set_tls_errors_policy(a->session, WEBKIT_TLS_ERRORS_POLICY_FAIL);
-    webkit_network_session_set_itp_enabled(a->session,
-            GET_BOOL(c, "intelligent-tracking-prevention"));
-    apply_cookie_policy(a->session, GET_CHAR(c, "cookie-accept"));
-    vb_session_setup(a->session);
-
+    make_session(a, c);
     update_status(a);
     archives = g_list_prepend(archives, a);
     return a;
@@ -623,6 +633,10 @@ WebKitNetworkSession *archiving_session(struct Archive *archive)
 
 void archiving_tab_added(Client *c)
 {
+    if (c->archive->state == ARCHIVE_REPLAYING) {
+        c->archive->tabs++;         /* a replay lists no pages */
+        return;
+    }
     if (!page_states) {
         page_states = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
@@ -657,7 +671,7 @@ void archiving_tab_closed(Client *c)
      * goes, once it has. */
     if (a->state == ARCHIVE_RECORDING || a->state == ARCHIVE_PAUSED) {
         archive_stop(a);
-    } else if (a->state == ARCHIVE_DONE) {
+    } else if (a->state == ARCHIVE_DONE || a->state == ARCHIVE_REPLAYING) {
         archive_free(a);
     }
 }
@@ -719,10 +733,21 @@ VbCmdResult archiving_command(Client *c, const char *args)
                     : "Nothing is being archived");
             result = CMD_ERROR;
         } else if (!strcmp(word, "status")) {
-            static const char *states[] = {"recording", "paused", "being saved", "done"};
-            vb_echo(c, MSG_NORMAL, FALSE, "'%s': %s, %u responses%s%s", a->name, states[a->state],
-                    a->proxy ? archive_proxy_get_recorded(a->proxy) : 0,
-                    a->saved ? ", saved as " : "", a->saved ? a->saved : "");
+            static const char *states[] = {"recording", "paused", "being saved", "done",
+                "replaying"};
+            if (a->replay) {
+                guint served, missed;
+                archive_replay_counts(a->replay, &served, &missed);
+                vb_echo(c, MSG_NORMAL, FALSE, "'%s': replaying %s, %u answered from it, %u missing",
+                        a->name, a->replay_path, served, missed);
+            } else {
+                vb_echo(c, MSG_NORMAL, FALSE, "'%s': %s, %u responses%s%s", a->name,
+                        states[a->state], a->proxy ? archive_proxy_get_recorded(a->proxy) : 0,
+                        a->saved ? ", saved as " : "", a->saved ? a->saved : "");
+            }
+        } else if (a->state == ARCHIVE_REPLAYING) {
+            vb_echo(c, MSG_ERROR, TRUE, "'%s' is replayed, not recorded", a->name);
+            result = CMD_ERROR;
         } else if (a->state != ARCHIVE_RECORDING && a->state != ARCHIVE_PAUSED) {
             vb_echo(c, MSG_ERROR, TRUE, "'%s' is no longer recording", a->name);
             result = CMD_ERROR;
@@ -743,6 +768,110 @@ VbCmdResult archiving_command(Client *c, const char *args)
     g_free(word);
     g_free(text);
     return result;
+}
+
+/* ---- replay ------------------------------------------------------------ */
+
+/* A replay of the WACZ at path -- the one already open, if it is. */
+static struct Archive *replay_start(Client *c, const char *path, GError **error)
+{
+    char *real = g_canonicalize_filename(path, NULL);
+    for (GList *l = archives; l; l = l->next) {
+        struct Archive *a = l->data;
+        if (a->replay && !strcmp(a->replay_path, real)) {
+            g_free(real);
+            return a;
+        }
+    }
+    ArchiveReplay *replay = archive_replay_open(real, error);
+    if (!replay) {
+        g_prefix_error(error, "%s: ", path);
+        g_free(real);
+        return NULL;
+    }
+    struct Archive *a = g_new0(struct Archive, 1);
+    a->lock_fd     = -1;
+    a->state       = ARCHIVE_REPLAYING;
+    a->replay      = replay;
+    a->replay_path = real;
+    a->name        = g_strdup(archive_replay_title(replay));
+
+    char *data_dir = util_get_data_dir();
+    char *ca_dir   = g_build_filename(data_dir, "archive-ca", NULL);
+    ArchiveProxyOptions options = {
+        .ca_dir            = ca_dir,
+        .tmp_dir           = g_get_tmp_dir(),
+        .software          = "vimb " VERSION,
+        .check_peer_user   = TRUE,
+        .allow_certificate = on_allow_certificate,
+        .allow_data        = a,
+        .replay            = replay,
+    };
+    a->proxy = archive_proxy_start(&options, error);
+    g_free(ca_dir);
+    g_free(data_dir);
+    if (!a->proxy) {
+        archive_replay_free(replay);
+        g_free(a->replay_path);
+        g_free(a->name);
+        g_free(a);
+        return NULL;
+    }
+    make_session(a, c);
+    update_status(a);
+    archives = g_list_prepend(archives, a);
+    return a;
+}
+
+/* Where a replay begins: its only page, or the list of them. */
+static const char *replay_landing(struct Archive *a)
+{
+    const GPtrArray *pages = archive_replay_pages(a->replay);
+    return pages->len == 1 ? ((ArchiveReplayPage *)g_ptr_array_index(pages, 0))->url
+        : ARCHIVE_REPLAY_HOME;
+}
+
+VbCmdResult archiving_replay_command(Client *c, const char *args)
+{
+    char **argv = NULL;
+    GError *error = NULL;
+    if (!args || !*args || !g_shell_parse_argv(args, NULL, &argv, NULL) || !argv[0]
+            || (argv[1] && argv[2])) {
+        vb_echo(c, MSG_ERROR, TRUE, "Usage: :replay FILE.wacz [URL]");
+        g_strfreev(argv);
+        return CMD_ERROR;
+    }
+    char *path = util_expand(argv[0], UTIL_EXP_TILDE | UTIL_EXP_DOLLAR);
+    struct Archive *a = replay_start(c, path, &error);
+    g_free(path);
+    if (!a) {
+        vb_echo(c, MSG_ERROR, TRUE, "Can't replay %s", error->message);
+        g_error_free(error);
+        g_strfreev(argv);
+        return CMD_ERROR;
+    }
+    vb_tab_new_archive(a, argv[1] ? argv[1] : replay_landing(a));
+    g_strfreev(argv);
+    return CMD_SUCCESS;
+}
+
+struct Archive *archiving_replay_open(Client *c, const char *path, GError **error)
+{
+    return replay_start(c, path, error);
+}
+
+const char *archiving_replay_landing(struct Archive *a)
+{
+    return a->replay ? replay_landing(a) : NULL;
+}
+
+gboolean archiving_replay_counts(struct Archive *a, guint *served, guint *missed)
+{
+    if (!a->replay) {
+        return FALSE;
+    }
+    archive_replay_counts(a->replay, served, missed);
+    return TRUE;
 }
 
 /* ---- for scripts ------------------------------------------------------- */
@@ -826,7 +955,7 @@ void archiving_rename(struct Archive *a, const char *name)
 
 const char *archiving_state(struct Archive *a)
 {
-    static const char *states[] = {"recording", "paused", "saving", "done"};
+    static const char *states[] = {"recording", "paused", "saving", "done", "replaying"};
     return states[a->state];
 }
 

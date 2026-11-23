@@ -602,6 +602,52 @@ static void tool_crawl(Call *call)
     g_ptr_array_free(seeds, TRUE);
 }
 
+/* ---- replay ------------------------------------------------------------- */
+
+/* Whether the policy lets path be replayed: any WACZ, or only one this run
+ * saved. */
+static gboolean replay_allowed(Call *call, const char *path)
+{
+    if (call->policy->replay_any) {
+        return TRUE;
+    }
+    GPtrArray *saved = archiving_saved_all();
+    char *real = g_canonicalize_filename(path, NULL);
+    gboolean ok = FALSE;
+    for (guint i = 0; i < saved->len && !ok; i++) {
+        char *s = g_canonicalize_filename(g_ptr_array_index(saved, i), NULL);
+        ok = !strcmp(s, real);
+        g_free(s);
+    }
+    g_free(real);
+    return ok;
+}
+
+static void tool_replay_archive(Call *call)
+{
+    const char *path = arg_string(call, "path");
+    const char *url  = arg_string(call, "url");
+    if (!path) {
+        call_fail(call, "say which archive: the path of a WACZ");
+        return;
+    }
+    if (!replay_allowed(call, path)) {
+        call_fail(call, "only archives saved in this run can be replayed here");
+        return;
+    }
+    GError *error = NULL;
+    struct Archive *a = archiving_replay_open(vb_get_current_client(), path, &error);
+    if (!a) {
+        call_fail(call, "%s", error->message);
+        g_error_free(error);
+        return;
+    }
+    Client *c = vb_tab_new_archive(a, NULL);
+    call->tab = tab_number(c);
+    ops_load(c, url ? url : archiving_replay_landing(a), arg_number(call, "timeout", DEFAULT_TIMEOUT),
+            tab_result, call);
+}
+
 /* ---- scripts ------------------------------------------------------------ */
 
 static gboolean script_url_check(const char *url, char **why, gpointer data)
@@ -743,6 +789,15 @@ static const Tool tools[] = {
         "\"max_seconds\": {\"type\": \"number\"}, \"delay\": {\"type\": \"number\"}, "
         "\"scroll\": {\"type\": \"boolean\"}}, \"required\": [\"archive\", \"seeds\"]}",
         tool_crawl, FALSE},
+    {"replay_archive", "Open a tab replaying a WACZ archive: it shows what the archive holds, "
+        "and nothing else -- nothing is fetched from the web. Without url, it begins at the "
+        "archive's only page, or at a list of its pages. Links followed from the tab stay in "
+        "the replay. Read it as any tab (read_page, page_links, screenshot) to check what was "
+        "archived; a page that wasn't says \"Not in the archive\".",
+        "{\"type\": \"object\", \"properties\": {"
+        "\"path\": {\"type\": \"string\", \"description\": \"The WACZ, as stop_archive gave it.\"}, "
+        "\"url\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}, "
+        "\"required\": [\"path\"]}", tool_replay_archive, FALSE},
     {"run_lua", "Run a Lua 5.4 script in the browser, once the person has approved it -- for work "
         "that would take the other tools many calls, such as visiting pages in a loop. It has "
         "string, table, math, utf8, os.time/clock/date, and the vimb table: vimb.log(...), "

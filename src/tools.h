@@ -47,6 +47,7 @@ typedef struct {
     ToolUrlCheck url_check;             /* a further say on each URL opened; NULL: none */
     ToolApprove  approve_lua;           /* run_lua, and who lets a script run; NULL: none */
     ToolLearn    learn;                 /* told what scripts read from pages; NULL: nobody */
+    gboolean     replay_any;            /* replay_archive any WACZ, not only this run's */
     gpointer     url_check_data;        /* for the callbacks */
 } ToolPolicy;
 

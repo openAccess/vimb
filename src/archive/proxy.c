@@ -52,6 +52,7 @@ struct ArchiveProxy {
     ArchiveProxyAllowFunc allow_certificate;
     gpointer              allow_data;
     GMainContext          *owner_context;
+    ArchiveReplay         *replay;          /* answers everything, in replay */
 
     ArchiveCa             *ca;
     ArchiveRecorder       *recorder;        /* under lock; NULL once finished */
@@ -834,10 +835,37 @@ out:
 
 /* Passes one request from the browser to its site and the answer back.
  * Returns whether the browser's connection may carry another request. */
+/* Answers a request from the archive being replayed. */
+static gboolean replay_request(Conn *conn, Http1Parser *request, GByteArray *body,
+        const Destination *dest)
+{
+    const Http1Head *head = http1_parser_head(request);
+    ArchiveReplayRequest asked = {
+        .method   = head->method,
+        .url      = dest->uri,
+        .head     = head,
+        .body     = body->data,
+        .body_len = body->len,
+    };
+    gboolean found;
+    GBytes *answer = archive_replay_answer(conn->proxy->replay, &asked, &found);
+    gsize size;
+    const guint8 *data = g_bytes_get_data(answer, &size);
+    gboolean sent = write_out(conn->stream, data, size, conn->cancellable, NULL);
+    g_debug("replay: %s %s: %s", head->method, dest->uri, found ? "from the archive" : "missing");
+    g_bytes_unref(answer);
+    /* a websocket's handshake answered, there'd be nothing to speak to */
+    return sent && http1_parser_keep_alive(request)
+        && !http1_head_has_token(head, "Connection", "upgrade");
+}
+
 static gboolean serve_request(Conn *conn, Http1Parser *request, GByteArray *body,
         const Destination *dest)
 {
     ArchiveProxy *proxy   = conn->proxy;
+    if (proxy->replay) {
+        return replay_request(conn, request, body, dest);
+    }
     const Http1Head *head = http1_parser_head(request);
     gboolean recording    = proxy_recording(proxy);
     gboolean upgrade      = http1_head_has_token(head, "Connection", "upgrade")
@@ -1200,6 +1228,7 @@ ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **e
         : DEFAULT_MAX_RECORD;
     proxy->allow_certificate = options->allow_certificate;
     proxy->allow_data        = options->allow_data;
+    proxy->replay            = options->replay;
     proxy->owner_context     = g_main_context_ref(options->owner_context
             ? options->owner_context : g_main_context_default());
     proxy->hosts             = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);

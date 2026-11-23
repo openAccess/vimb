@@ -3405,6 +3405,7 @@ static gboolean start_mcp(void)
     /* the client is a program of the user's, which may want to crawl a
      * site whatever its certificates */
     policy.allow_archive_options = TRUE;
+    policy.replay_any            = TRUE;
     if (vb.mcp_allow_domains && *vb.mcp_allow_domains) {
         policy.allowed_domains = g_strsplit(vb.mcp_allow_domains, ",", -1);
         for (char **d = policy.allowed_domains; *d; d++) {

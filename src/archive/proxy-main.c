@@ -46,6 +46,7 @@ int main(int argc, char **argv)
     gboolean no_record      = FALSE;
     gboolean any_user       = FALSE;
     gint64 max_record_size  = 0;
+    char *replay_path       = NULL;
     GError *error           = NULL;
     GOptionEntry entries[]  = {
         {"dir", 'd', 0, G_OPTION_ARG_FILENAME, &dir,
@@ -60,6 +61,8 @@ int main(int argc, char **argv)
             "Serve other users' processes too", NULL},
         {"max-record-size", 0, 0, G_OPTION_ARG_INT64, &max_record_size,
             "Longest response recorded whole", "BYTES"},
+        {"replay", 0, 0, G_OPTION_ARG_FILENAME, &replay_path,
+            "Answer from this WACZ instead, touching no network", "WACZ"},
         {NULL}
     };
     GOptionContext *context = g_option_context_new("- vimb's archiving proxy");
@@ -79,6 +82,15 @@ int main(int argc, char **argv)
     g_free(stamp);
     g_free(name);
 
+    ArchiveReplay *replay = NULL;
+    if (replay_path && !(replay = archive_replay_open(replay_path, &error))) {
+        fprintf(stderr, "%s: %s\n", replay_path, error->message);
+        return 1;
+    }
+    if (replay) {
+        no_record = TRUE;
+    }
+
     ArchiveProxyOptions options = {
         .ca_dir          = dir,
         .warc_path       = no_record ? NULL : warc_path,
@@ -88,6 +100,7 @@ int main(int argc, char **argv)
         .allow_internal  = allow_internal,
         .check_peer_user = !any_user,
         .max_record_size = max_record_size > 0 ? (guint64)max_record_size : 0,
+        .replay          = replay,
     };
     ArchiveProxy *proxy = archive_proxy_start(&options, &error);
     if (!proxy) {
@@ -111,7 +124,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s\n", error->message);
         return 1;
     }
-    printf("stopped; %u or more exchanges recorded\n", recorded);
+    if (replay) {
+        guint served, missed;
+        archive_replay_counts(replay, &served, &missed);
+        printf("stopped; %u answered from the archive, %u missing\n", served, missed);
+        archive_replay_free(replay);
+    } else {
+        printf("stopped; %u or more exchanges recorded\n", recorded);
+    }
     g_main_loop_unref(loop);
     g_free(warc_path);
     g_free(dir);

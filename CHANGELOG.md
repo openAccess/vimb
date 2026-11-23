@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   limit, no io, os.execute, require or load, no `t:eval` or `vimb.quit`, the
   assistant's rule for URLs, and an instruction budget. `--assistant-scripts`
   lets them run unasked in a headless task.
+* Replay: `:replay FILE.wacz [URL]` replays a WACZ in a tab, answered from
+  the archive alone -- never from the network -- each page as it was when
+  archived. What wasn't archived comes to a page saying so, and why. Also
+  `vimb.replay()` for scripts and `replay_archive` for MCP and the assistant.
 * Unattended runs: `--assistant-task-file FILE`, `--summary FILE` (what
   the run came to, as JSON), and `--timeout SECONDS` (stop, save, exit 2).
   `contrib/container` builds an image that runs vimb under Xvfb for an

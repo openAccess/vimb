@@ -112,6 +112,21 @@ async def full_run():
         saved = value(await client.call_tool("stop_archive", {"archive": n}))
         path = saved.get("saved", "")
         check("stop_archive", path.endswith(".wacz") and os.path.exists(path), path)
+
+        # replay what was saved: what it holds comes back, nothing else does
+        replay = value(await client.call_tool("replay_archive", {"path": path}))
+        check("replay_archive opens the list of pages", replay.get("status") == 200
+              and replay.get("title") == "mcp test", json.dumps(replay))
+        listed = value(await client.call_tool("page_links", {"tab": replay["tab"]}))["links"]
+        check("the list links the pages", any(l["url"] == SITE + "index.html" for l in listed),
+              json.dumps(listed)[:200])
+        page = value(await client.call_tool("load_page", {"tab": replay["tab"],
+                                                          "url": SITE + "c.html"}))
+        check("a crawled page replays", page.get("status") == 200 and page.get("title") == "Page C",
+              json.dumps(page))
+        page = value(await client.call_tool("load_page", {"tab": replay["tab"],
+                                                          "url": SITE + "b.html"}))
+        check("a page never archived doesn't", page.get("status") == 404, json.dumps(page))
         return path
 
 

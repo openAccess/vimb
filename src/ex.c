@@ -83,6 +83,7 @@ typedef enum {
     EX_QUNSHIFT,
 #endif
     EX_QUIT,
+    EX_REPLAY,
     EX_QUITALL,
     EX_REG,
     EX_SAVE,
@@ -154,6 +155,7 @@ static VbCmdResult ex_autocmd(Client *c, const ExArg *arg);
 #endif
 static VbCmdResult ex_archive(Client *c, const ExArg *arg);
 static VbCmdResult ex_assistant(Client *c, const ExArg *arg);
+static VbCmdResult ex_replay(Client *c, const ExArg *arg);
 static VbCmdResult ex_bookmark(Client *c, const ExArg *arg);
 static VbCmdResult ex_eval(Client *c, const ExArg *arg);
 static void on_eval_script_finished_usermessage(GObject *source_object,
@@ -232,6 +234,7 @@ static ExInfo commands[] = {
     {"qpush",            EX_QPUSH,       ex_queue,      EX_FLAG_RHS},
 #endif
     {"register",         EX_REG,         ex_register,   EX_FLAG_NONE},
+    {"replay",           EX_REPLAY,      ex_replay,     EX_FLAG_RHS},
     {"save",             EX_SAVE,        ex_save,       EX_FLAG_RHS|EX_FLAG_EXP},
     {"set",              EX_SET,         ex_set,        EX_FLAG_RHS},
     {"shellcmd",         EX_SHELLCMD,    ex_shellcmd,   EX_FLAG_CMD|EX_FLAG_EXP|EX_FLAG_BANG},
@@ -898,6 +901,11 @@ static VbCmdResult ex_lua(Client *c, const ExArg *arg)
 static VbCmdResult ex_archive(Client *c, const ExArg *arg)
 {
     return archiving_command(c, arg->rhs->str);
+}
+
+static VbCmdResult ex_replay(Client *c, const ExArg *arg)
+{
+    return archiving_replay_command(c, arg->rhs->str);
 }
 
 static VbCmdResult ex_assistant(Client *c, const ExArg *arg)

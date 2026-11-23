@@ -22,6 +22,8 @@
 
 #include <gio/gio.h>
 
+#include "replay.h"
+
 /* The archiving proxy: an HTTP proxy on the loopback address that an
  * archiving tab's network session is pointed at, and that writes what passes
  * through it to a WARC file.
@@ -66,6 +68,10 @@ typedef struct {
     ArchiveProxyAllowFunc allow_certificate;
     gpointer              allow_data;
     GMainContext          *owner_context;   /* NULL: the default main context */
+    /* Replay: every request is answered from this archive (see replay.h), and
+     * nothing is fetched or recorded -- the network isn't touched at all.
+     * It must last as long as the proxy. */
+    ArchiveReplay         *replay;
 } ArchiveProxyOptions;
 
 ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **error);

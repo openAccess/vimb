@@ -722,8 +722,8 @@ Removes all bookmarks for given \fIURI\fP or, if not given, the current opened
 page.
 .
 .SS Archiving
-Archiving makes a web archive of what is browsed: a WACZ file, which tools
-such as ReplayWeb.page and pywb replay.
+Archiving makes a web archive of what is browsed: a WACZ file, which vimb
+replays (\fB:replay\fP), as do tools such as ReplayWeb.page and pywb.
 Everything an archiving tab loads goes through an archiving proxy within vimb
 and is recorded as it was sent, and so is everything loaded in tabs and
 popups opened from it.
@@ -759,6 +759,18 @@ These commands act on the archive of the current tab, or on the one archive
 being recorded.
 An archive is kept as loose files until it is saved, so that nothing is lost
 if vimb crashes: on its next start, vimb saves what it finds.
+.TP
+.BI ":replay " "file.wacz " [ url ]
+Open a tab replaying the archive in \fIfile.wacz\fP, at \fIurl\fP, or at
+its only page, or at a list of the pages it holds.
+Everything the tab loads is answered from the archive and nothing from the
+web, as is everything loaded in tabs opened from it: a link followed to a
+page that wasn't archived comes to a page saying so, and why.
+Each page is replayed as it was when it was archived, and what it loads as it
+was then.
+The status bar of a replaying tab shows `[REPLAY name]', and
+\fB:archive status\fP says how many requests the archive answered, and how
+many it couldn't.
 .
 .SS Scripting
 Lua scripts can drive vimb: open pages and wait for them, read them, archive
@@ -783,6 +795,10 @@ Wait.
 .TP
 .BI vimb.quit([ status ])
 Quit vimb.
+.TP
+.BI vimb.replay( "file " [, url ])
+Open a tab replaying an archive (see \fB:replay\fP); returns the tab and
+what loaded.
 .TP
 .B vimb.tab(), vimb.tabs()
 The current tab; all tabs.
@@ -941,6 +957,11 @@ Save the archive: {archive, saved}.
 .TP
 .BR crawl " {archive, seeds, scope, pattern, depth, max_pages, max_seconds, delay, scroll}"
 As \fBa:crawl\fP in \fBScripting\fP.
+.TP
+.BR replay_archive " {path, url}"
+Open a tab replaying the WACZ at \fIpath\fP (see \fB:replay\fP): {tab, url,
+status, title}.
+The assistant may replay only archives saved in the same run.
 .PP
 For example, from Python:
 .sp

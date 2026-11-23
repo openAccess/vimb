@@ -73,6 +73,17 @@ const char *archiving_state(struct Archive *archive);   /* "recording", ... */
 guint archiving_recorded(struct Archive *archive);
 const char *archiving_saved(struct Archive *archive);   /* the WACZ, once saved */
 
+/* :replay FILE [URL]: a tab replaying a WACZ -- answered from it alone,
+ * never from the network -- as do tabs opened from it. */
+VbCmdResult archiving_replay_command(Client *c, const char *args);
+
+/* For scripts: a replay of the WACZ at path (the one open already, if it
+ * is), to open tabs in with vb_tab_new_archive(); where it begins; how many
+ * requests it answered, and couldn't. It ends with its last tab. */
+struct Archive *archiving_replay_open(Client *c, const char *path, GError **error);
+const char *archiving_replay_landing(struct Archive *archive);
+gboolean archiving_replay_counts(struct Archive *archive, guint *served, guint *missed);
+
 /* Packages any capture a crash left behind, in the background. */
 void archiving_recover(Client *c);
 
