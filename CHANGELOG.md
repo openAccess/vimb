@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   stops and clears it. It opens only URLs that came from the user or from
   pages. Settings `assistant`, `assistant-model` and `assistant-effort`.
   `--assistant-task TEXT` runs one task headless and quits.
+* The assistant can write Lua scripts, which run once the user says
+  `:assistant yes`, in a sandbox: a Lua state of their own with a memory
+  limit, no io, os.execute, require or load, no `t:eval` or `vimb.quit`, the
+  assistant's rule for URLs, and an instruction budget. `--assistant-scripts`
+  lets them run unasked in a headless task.
+* `--mcp-http PORT` serves MCP over HTTP (the streamable HTTP transport) at
+  127.0.0.1:PORT/mcp to the user's own programs, with sessions, and calls
+  that stream with keepalives. Linux only.
 
 ## Changed
 * Use webkit's built-in user-agent as default for setting `user-agent`

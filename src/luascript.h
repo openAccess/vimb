@@ -20,6 +20,8 @@
 #ifndef _LUASCRIPT_H
 #define _LUASCRIPT_H
 
+#include <json-glib/json-glib.h>
+
 #include "main.h"
 
 /* Lua scripting: scripts that drive the browser -- open pages, wait for
@@ -34,5 +36,36 @@ void luascript_run_file(Client *c, const char *path, gboolean exit_when_done);
 
 /* Runs a chunk of Lua given on the command line (:lua). */
 void luascript_run_string(Client *c, const char *code);
+
+/* Sandboxed scripts: Lua written by the assistant, run apart from the
+ * user's own scripts -- in a Lua state of their own, with a memory limit,
+ * only the libraries that can't reach outside (string, table, math, utf8,
+ * and os's clock), and an instruction budget between waits. They have the
+ * vimb table, less vimb.quit, t:eval, on_page and archive options; every URL
+ * they would open is put to url_check, and what they read from pages is
+ * passed to learn. */
+typedef struct LuaRun LuaRun;
+typedef gboolean (*LuaUrlCheck)(const char *url, char **why, gpointer data);
+typedef void (*LuaLearn)(JsonNode *value, gpointer data);
+typedef struct {
+    LuaUrlCheck url_check;
+    LuaLearn    learn;
+    gpointer    data;
+} LuaPolicy;
+
+/* Called once, from the main loop, when the script ends: with its value (what
+ * it returned, as JSON: null, a value, or an array of them) or why it failed;
+ * and what it logged. */
+typedef void (*LuaRunDone)(gboolean ok, const char *error, JsonNode *value, const char *log,
+        gpointer data);
+
+/* The run lasts until done is called -- which may be before this returns,
+ * for a script that doesn't compile or never waits; the run is gone then. */
+LuaRun *luascript_run_sandboxed(const char *code, const LuaPolicy *policy, LuaRunDone done,
+        gpointer data);
+
+/* Stops a sandboxed script: it ends, failed, once what it is waiting for is
+ * over (done is still called). */
+void luascript_cancel(LuaRun *run);
 
 #endif /* end of include guard: _LUASCRIPT_H */

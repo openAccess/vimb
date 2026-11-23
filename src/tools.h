@@ -34,13 +34,20 @@
  * crawl.h), whatever the pages it reads say. */
 
 typedef gboolean (*ToolUrlCheck)(const char *url, char **why, gpointer data);
+typedef void (*ToolLearn)(JsonNode *value, gpointer data);
+/* The answer to whether a script may run: call it once. */
+typedef void (*ToolApproved)(gboolean yes, gpointer done_data);
+typedef void (*ToolApprove)(const char *code, const char *description, ToolApproved done,
+        gpointer done_data, gpointer data);
 
 typedef struct {
     gboolean     allow_eval;            /* run_javascript */
     gboolean     allow_archive_options; /* strict_ssl and allow_internal for archives */
     char         **allowed_domains;     /* the sites URLs must be on; NULL: any */
     ToolUrlCheck url_check;             /* a further say on each URL opened; NULL: none */
-    gpointer     url_check_data;
+    ToolApprove  approve_lua;           /* run_lua, and who lets a script run; NULL: none */
+    ToolLearn    learn;                 /* told what scripts read from pages; NULL: nobody */
+    gpointer     url_check_data;        /* for the callbacks */
 } ToolPolicy;
 
 typedef struct {
@@ -64,6 +71,10 @@ void tools_call(const char *name, JsonObject *arguments, const ToolPolicy *polic
 
 /* The number tools name a tab by. */
 guint tools_tab_number(Client *c);
+
+/* Stops the scripts run_lua is running: each ends, failed, when what it
+ * waits for is over. */
+void tools_cancel_scripts(void);
 
 /* Lets go of the archives the tools started -- those still recording stop,
  * and are saved. */

@@ -62,6 +62,8 @@ typedef struct {
     GPtrArray     *results;
     AssistantDone done;
     gpointer      done_data;
+    ToolApproved  approve;      /* a script waiting for the person's say */
+    gpointer      approve_data;
     /* the pane */
     GtkWidget     *pane;
     GtkTextView   *view;
@@ -93,6 +95,10 @@ static void pane_create(void)
             "foreground", "#7a7a7a", NULL);
     gtk_text_buffer_create_tag(A.buffer, "tool", "foreground", "#5a7f9a", "scale", 0.9, NULL);
     gtk_text_buffer_create_tag(A.buffer, "error", "foreground", "#c0392b", NULL);
+    gtk_text_buffer_create_tag(A.buffer, "code", "family", "monospace", "left-margin", 20,
+            "scale", 0.9, NULL);
+    gtk_text_buffer_create_tag(A.buffer, "ask", "weight", PANGO_WEIGHT_BOLD,
+            "foreground", "#b9770e", NULL);
     gtk_widget_set_name(GTK_WIDGET(A.view), "assistant");
 
     A.pane = gtk_scrolled_window_new();
@@ -304,6 +310,51 @@ static gboolean url_check(const char *url, char **why, gpointer data)
     return ok;
 }
 
+static void learn_value(JsonNode *value, gpointer data)
+{
+    learn_node(value);
+}
+
+/* ---- scripts ----------------------------------------------------------- */
+
+static void answer_script(gboolean yes)
+{
+    ToolApproved approve = A.approve;
+    gpointer data        = A.approve_data;
+    A.approve = NULL;
+    if (approve) {
+        approve(yes, data);
+    }
+}
+
+/* Shows the script the assistant wants to run, and waits for the person's
+ * say -- unless nobody is at the keyboard, and --assistant-scripts said yes
+ * beforehand. */
+static void approve_script(const char *code, const char *description, ToolApproved done,
+        gpointer done_data, gpointer data)
+{
+    pane_show(TRUE);
+    if (*description) {
+        pane_line("ask", "The assistant wants to run a script: %s", description);
+    } else {
+        pane_line("ask", "The assistant wants to run a script:");
+    }
+    pane_line("code", "%s", code);
+    if (vb.scripted) {
+        pane_line("tool", "(run without asking, as --assistant-scripts says)");
+        done(TRUE, done_data);
+        return;
+    }
+    answer_script(FALSE);           /* there is only ever one, but still */
+    A.approve      = done;
+    A.approve_data = done_data;
+    pane_line("ask", "Run it? :assistant yes, or :assistant no");
+    Client *c = vb_get_current_client();
+    if (c) {
+        vb_echo(c, MSG_NORMAL, FALSE, "The assistant wants to run a script: :assistant yes / no");
+    }
+}
+
 /* ---- the turn ---------------------------------------------------------- */
 
 static void turn_over(const char *error)
@@ -475,6 +526,8 @@ static void on_turn_done(GPtrArray *calls, const char *stop, const char *error, 
 static void stop_turn(void)
 {
     A.generation++;
+    answer_script(FALSE);
+    tools_cancel_scripts();
     if (A.backend) {
         A.backend->cancel(A.backend);
     }
@@ -515,6 +568,9 @@ static gboolean ensure_backend(Client *c)
     A.policy.allow_archive_options = FALSE;
     A.policy.allowed_domains       = NULL;
     A.policy.url_check             = url_check;
+    A.policy.learn                 = learn_value;
+    /* scripts, if somebody can say yes to them, or said so beforehand */
+    A.policy.approve_lua = !vb.scripted || vb.assistant_scripts ? approve_script : NULL;
 
     const char *name = GET_CHAR(c, "assistant");
     JsonNode *tools  = tools_list(&A.policy);
@@ -600,11 +656,19 @@ VbCmdResult assistant_command(Client *c, const char *args)
         stop_turn();
     } else if (!strcmp(args, "clear")) {
         clear();
+    } else if (!strcmp(args, "yes") || !strcmp(args, "no")) {
+        if (!A.approve) {
+            vb_echo(c, MSG_ERROR, TRUE, "The assistant isn't asking anything");
+            return CMD_ERROR;
+        }
+        gboolean yes = !strcmp(args, "yes");
+        pane_line("you", "%s", yes ? "Yes, run it." : "No.");
+        answer_script(yes);
     } else if (!strcmp(args, "status")) {
         vb_echo(c, MSG_NORMAL, FALSE, "Assistant: %s%s", A.backend ? A.backend->name : "not started",
                 A.busy ? ", working" : "");
     } else {
-        vb_echo(c, MSG_ERROR, TRUE, "Usage: :assistant [show|hide|stop|clear|status]");
+        vb_echo(c, MSG_ERROR, TRUE, "Usage: :assistant [show|hide|stop|clear|status|yes|no]");
         return CMD_ERROR;
     }
     return CMD_SUCCESS;

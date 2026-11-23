@@ -3337,8 +3337,13 @@ static gboolean start_mcp(void)
             g_strstrip(*d);
         }
     }
-    if (!mcp_serve_stdio(STDIN_FILENO, vb.mcp_out, &policy, &error)) {
+    if (vb.mcp && !mcp_serve_stdio(STDIN_FILENO, vb.mcp_out, &policy, &error)) {
         fprintf(stderr, "vimb: --mcp: %s\n", error->message);
+        g_error_free(error);
+        return FALSE;
+    }
+    if (vb.mcp_http && !mcp_serve_http((guint)vb.mcp_http, &policy, &error)) {
+        fprintf(stderr, "vimb: --mcp-http: %s\n", error->message);
         g_error_free(error);
         return FALSE;
     }
@@ -3398,7 +3403,9 @@ int main(int argc, char* argv[])
         {"script", 0, 0, G_OPTION_ARG_FILENAME, &vb.script, "Run a Lua script, then quit", "FILE"},
         {"window-size", 0, 0, G_OPTION_ARG_CALLBACK, (GOptionArgFunc*)windowSizeOptionArgFunc, "Window size", "WIDTHxHEIGHT"},
         {"assistant-task", 0, 0, G_OPTION_ARG_STRING, &vb.assistant_task, "Give the assistant a task, then quit when it is done", "TEXT"},
+        {"assistant-scripts", 0, 0, G_OPTION_ARG_NONE, &vb.assistant_scripts, "Let the assistant's scripts run without asking, when nobody is at the keyboard", NULL},
         {"mcp", 0, 0, G_OPTION_ARG_NONE, &vb.mcp, "Serve the Model Context Protocol on stdin and stdout", NULL},
+        {"mcp-http", 0, 0, G_OPTION_ARG_INT, &vb.mcp_http, "Serve the Model Context Protocol over HTTP on 127.0.0.1:PORT", "PORT"},
         {"mcp-allow-eval", 0, 0, G_OPTION_ARG_NONE, &vb.mcp_allow_eval, "Let MCP clients run JavaScript in pages", NULL},
         {"mcp-allow-domains", 0, 0, G_OPTION_ARG_STRING, &vb.mcp_allow_domains, "The only sites MCP clients may open", "DOMAIN,..."},
         {"bug-info", 0, 0, G_OPTION_ARG_NONE, &buginfo, "Print used library versions", NULL},
@@ -3520,7 +3527,7 @@ int main(int argc, char* argv[])
     if (vb.script) {
         g_idle_add(run_script, c);
     }
-    if (vb.mcp && !start_mcp()) {
+    if ((vb.mcp || vb.mcp_http) && !start_mcp()) {
         return EXIT_FAILURE;
     }
     if (vb.assistant_task) {

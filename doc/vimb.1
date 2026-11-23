@@ -83,10 +83,20 @@ What it says, and the tools it uses, are printed on stderr.
 Archives it left recording are saved first.
 Nobody is taken to be at the keyboard, as with \fB\-\-script\fP.
 .TP
+.B "\-\-assistant-scripts"
+With \fB\-\-assistant-task\fP, let the assistant run the scripts it writes
+without asking, as nobody is there to say yes; without it, it is offered no
+scripts.
+.TP
 .B "\-\-mcp"
 Serve the Model Context Protocol on stdin and stdout (see \fBMCP\fP), until
 stdin closes; then save any archive still recording, and quit.
 Nobody is taken to be at the keyboard, as with \fB\-\-script\fP.
+.TP
+.BI "\-\-mcp-http " PORT
+Serve the Model Context Protocol over HTTP at http://127.0.0.1:\fIPORT\fP/mcp
+(see \fBMCP\fP), for as long as vimb runs.
+Linux only.
 .TP
 .B "\-\-mcp-allow-eval"
 Offer MCP clients the run_javascript tool.
@@ -849,6 +859,18 @@ Without \fItext\fP, show the pane.
 .B :assistant [show | hide | stop | clear | status]
 Toggle the pane, or show or hide it; stop what the assistant is doing; begin
 the conversation again; or say which model it is and whether it is working.
+.TP
+.B :assistant yes | no
+Let a script the assistant wrote run, or not.
+.PP
+The assistant can write Lua scripts (see \fBScripting\fP) for work its tools
+would take many steps to do, such as visiting pages in a loop.
+Each is shown in the pane, and runs only once you say \fB:assistant yes\fP.
+It runs apart from your own scripts, with a memory limit, none of the
+libraries that reach outside (no io, os.execute, require or load), and no
+t:eval, vimb.quit, on_page or archive options; the URLs it opens are held to
+the assistant's rule, and a script that computes on and on without waiting is
+stopped.
 .PP
 For example:
 .sp
@@ -860,6 +882,10 @@ For example:
 With \fB\-\-mcp\fP, vimb is a Model Context Protocol server: a program, or an
 AI assistant, drives it with the tools below, sending JSON-RPC messages a
 line each on vimb's stdin and reading the answers on its stdout.
+With \fB\-\-mcp-http\fP \fIPORT\fP, a vimb you are using is one too, at
+http://127.0.0.1:\fIPORT\fP/mcp (MCP's streamable HTTP): it serves only your
+own user's programs \(em the kernel is asked whose each connection is \(em
+and no web page.
 Tabs and archives are named by number.
 Only http and https URLs are opened.
 contrib/python/vimb.py is a client for Python that needs nothing else.

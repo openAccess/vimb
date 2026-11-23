@@ -21,6 +21,7 @@
 #include <lua.h>
 #include <lualib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "archiving.h"
@@ -35,12 +36,29 @@
 
 extern struct Vimb vb;
 
-typedef struct {
-    lua_State *co;          /* the script's coroutine */
-    int       ref;          /* keeps it from being collected while it runs */
-    gboolean  exit_when_done;
-    char      *name;
-} Script;
+/* Instructions a sandboxed script may run between waits, and the memory
+ * sandboxed scripts may use between them. */
+#define SANDBOX_STEPS       (200 * 1000 * 1000)
+#define SANDBOX_HOOK_EVERY  10000
+#define SANDBOX_MEMORY      (256 * 1024 * 1024)
+#define SANDBOX_LOG_MAX     (64 * 1024)
+
+typedef struct LuaRun Script;
+struct LuaRun {
+    lua_State  *co;         /* the script's coroutine */
+    lua_State  *main;       /* the state it is a thread of */
+    int        ref;         /* keeps it from being collected while it runs */
+    gboolean   exit_when_done;
+    char       *name;
+    /* sandboxed */
+    gboolean   sandboxed;
+    LuaPolicy  policy;
+    LuaRunDone done;
+    gpointer   done_data;
+    GString    *log;
+    gboolean   cancelled;
+    guint64    steps;
+};
 
 typedef struct {
     guint64 id;
@@ -51,10 +69,24 @@ typedef struct {
 } LuaArchive;
 
 static lua_State *L;        /* the main state, whose threads scripts are */
+static lua_State *SL;       /* the sandboxed scripts' */
+static size_t sandbox_memory;
+/* The memory limit holds only while a sandboxed script runs, where running
+ * out is an error the script fails by; elsewhere -- vimb pushing a result,
+ * or making a traceback -- it would be a panic. */
+static gboolean sandbox_enforce;
+
+static void init(void);
+static void init_sandbox(void);
+static void add_vimb(lua_State *state);
+static int l_log(lua_State *co);
+static void sandbox_hook(lua_State *co, lua_Debug *ar);
+static void start_on(lua_State *main, Script *s, int load_status, const char *name,
+        gboolean exit_when_done, Client *c);
 
 static Script *script_of(lua_State *co)
 {
-    return *(Script **)lua_getextraspace(co);
+    return *(Script **)lua_getextraspace(co);    /* NULL on a main state */
 }
 
 static void report(Client *c, gboolean error, const char *message)
@@ -68,9 +100,43 @@ static void report(Client *c, gboolean error, const char *message)
 
 /* ---- running ----------------------------------------------------------- */
 
-static void script_end(Script *s, int status)
+static JsonNode *to_json(lua_State *co, int index, int depth);
+
+/* A sandboxed script's end: its value, or why it failed, to whoever ran it. */
+static void sandbox_end(Script *s, int status, int nresults)
 {
-    if (status != LUA_OK) {
+    JsonNode *value = NULL;
+    char *error     = NULL;
+    if (status == LUA_OK) {
+        int top = lua_gettop(s->co);
+        if (nresults == 1) {
+            value = to_json(s->co, top, 0);
+        } else if (nresults > 1) {
+            JsonArray *all = json_array_new();
+            for (int i = top - nresults + 1; i <= top; i++) {
+                json_array_add_element(all, to_json(s->co, i, 0));
+            }
+            value = json_node_new(JSON_NODE_ARRAY);
+            json_node_take_array(value, all);
+        }
+    } else {
+        const char *message = lua_tostring(s->co, -1);
+        luaL_traceback(s->main, s->co, message ? message : "error", 0);
+        error = g_strdup(lua_tostring(s->main, -1));
+        lua_pop(s->main, 1);
+    }
+    s->done(status == LUA_OK, error, value, s->log->str, s->done_data);
+    if (value) {
+        json_node_unref(value);
+    }
+    g_free(error);
+}
+
+static void script_end(Script *s, int status, int nresults)
+{
+    if (s->sandboxed) {
+        sandbox_end(s, status, nresults);
+    } else if (status != LUA_OK) {
         const char *message = lua_tostring(s->co, -1);
         luaL_traceback(L, s->co, message ? message : "error", 0);
         char *text = g_strdup_printf("vimb: %s: %s", s->name, lua_tostring(L, -1));
@@ -79,9 +145,17 @@ static void script_end(Script *s, int status)
         lua_pop(L, 1);
     }
     gboolean exit_when_done = s->exit_when_done;
-    luaL_unref(L, LUA_REGISTRYINDEX, s->ref);
+    lua_State *main = s->main;
+    luaL_unref(main, LUA_REGISTRYINDEX, s->ref);
+    if (s->log) {
+        g_string_free(s->log, TRUE);
+    }
     g_free(s->name);
     g_free(s);
+    if (main == SL) {
+        /* what the script held -- archives -- is let go of now, not later */
+        lua_gc(SL, LUA_GCCOLLECT);
+    }
     if (exit_when_done) {
         vb_exit(status == LUA_OK ? 0 : 1);
     }
@@ -92,12 +166,52 @@ static void script_end(Script *s, int status)
 static void script_resume(Script *s, int nargs)
 {
     int nresults = 0;
-    int status   = lua_resume(s->co, L, nargs, &nresults);
+    int status;
+    if (s->cancelled) {
+        /* what it waited for is over, and it is stopped instead */
+        lua_settop(s->co, 0);
+        lua_pushstring(s->co, "the script was stopped");
+        script_end(s, LUA_ERRRUN, 0);
+        return;
+    }
+    s->steps = 0;
+    sandbox_enforce = s->sandboxed;
+    status = lua_resume(s->co, s->main, nargs, &nresults);
+    sandbox_enforce = FALSE;
     if (status == LUA_YIELD) {
         lua_pop(s->co, nresults);   /* waiting again */
         return;
     }
-    script_end(s, status);
+    script_end(s, status, nresults);
+}
+
+/* Fails a waiting call made where it can't wait -- before it starts what it
+ * would wait for, whose end would otherwise come to nobody. */
+static void can_wait(lua_State *co)
+{
+    if (!lua_isyieldable(co) || !script_of(co)) {
+        luaL_error(co, "can't wait here (inside a callback or a metamethod)");
+    }
+}
+
+/* For a sandboxed script, whether it may open url; raises an error if not. */
+static void check_url(lua_State *co, const char *url)
+{
+    Script *s = script_of(co);
+    char *why = NULL;
+    if (s && s->sandboxed && !s->policy.url_check(url, &why, s->policy.data)) {
+        lua_pushstring(co, why ? why : "not allowed");
+        g_free(why);
+        lua_error(co);
+    }
+}
+
+static void deny_sandboxed(lua_State *co, const char *what)
+{
+    Script *s = script_of(co);
+    if (!s || s->sandboxed) {
+        luaL_error(co, "%s isn't available to this script", what);
+    }
 }
 
 /* Suspends the script until a callback resumes it. */
@@ -155,10 +269,94 @@ static void push_json(lua_State *co, JsonNode *node)
     }
 }
 
+/* A Lua value as JSON: a table as an array if it is a sequence, else as an
+ * object; a tab or an archive as what names it. */
+static JsonNode *to_json(lua_State *co, int index, int depth)
+{
+    JsonNode *node = json_node_new(JSON_NODE_VALUE);
+    index = lua_absindex(co, index);
+    switch (lua_type(co, index)) {
+        case LUA_TBOOLEAN:
+            json_node_set_boolean(node, lua_toboolean(co, index));
+            return node;
+        case LUA_TNUMBER:
+            if (lua_isinteger(co, index)) {
+                json_node_set_int(node, lua_tointeger(co, index));
+            } else {
+                json_node_set_double(node, lua_tonumber(co, index));
+            }
+            return node;
+        case LUA_TSTRING:
+            json_node_set_string(node, lua_tostring(co, index));
+            return node;
+        case LUA_TUSERDATA: {
+            LuaTab *t     = luaL_testudata(co, index, TAB_META);
+            LuaArchive *a = luaL_testudata(co, index, ARCHIVE_META);
+            Client *c     = t ? ops_find_tab(t->id) : NULL;
+            if (c) {
+                json_node_set_string(node, webkit_web_view_get_uri(c->webview));
+            } else if (a && archiving_alive(a->archive)) {
+                json_node_set_string(node, archiving_saved(a->archive)
+                        ? archiving_saved(a->archive) : archiving_name(a->archive));
+            } else {
+                json_node_init_null(node);
+            }
+            return node;
+        }
+        case LUA_TTABLE:
+            break;
+        default:
+            json_node_init_null(node);
+            return node;
+    }
+    if (depth > 20) {
+        json_node_set_string(node, "...");
+        return node;
+    }
+    lua_Integer n = (lua_Integer)lua_rawlen(co, index);
+    gboolean sequence = TRUE;
+    lua_pushnil(co);
+    while (sequence && lua_next(co, index)) {
+        sequence = lua_isinteger(co, -2) && lua_tointeger(co, -2) >= 1
+            && lua_tointeger(co, -2) <= n;
+        lua_pop(co, 1);
+        if (!sequence) {
+            lua_pop(co, 1);
+        }
+    }
+    if (sequence && n > 0) {
+        JsonArray *array = json_array_new();
+        for (lua_Integer i = 1; i <= n; i++) {
+            lua_rawgeti(co, index, i);
+            json_array_add_element(array, to_json(co, -1, depth + 1));
+            lua_pop(co, 1);
+        }
+        json_node_init_array(node, array);
+        json_array_unref(array);
+        return node;
+    }
+    JsonObject *object = json_object_new();
+    lua_pushnil(co);
+    while (lua_next(co, index)) {
+        lua_pushvalue(co, -2);
+        const char *key = lua_tostring(co, -1);   /* a copy: the key itself mustn't change */
+        if (key) {
+            json_object_set_member(object, key, to_json(co, -2, depth + 1));
+        }
+        lua_pop(co, 2);
+    }
+    json_node_init_object(node, object);
+    json_object_unref(object);
+    return node;
+}
+
 /* Resumes with the value, or with nil and why not. */
 static void resume_value(gboolean ok, const char *error, JsonNode *value, gpointer data)
 {
     Script *s = data;
+    if (ok && s->sandboxed && value && s->policy.learn && !s->cancelled) {
+        s->policy.learn(value, s->policy.data);
+    }
     if (ok) {
         push_json(s->co, value);
         script_resume(s, 1);
@@ -248,7 +446,16 @@ static int l_log(lua_State *co)
         }
     }
     luaL_pushresult(&b);
-    report(NULL, FALSE, lua_tostring(co, -1));
+    Script *s = script_of(co);
+    if (s && s->sandboxed) {
+        if (s->log->len < SANDBOX_LOG_MAX) {
+            g_string_append_printf(s->log, "%s\n", lua_tostring(co, -1));
+        }
+    } else if (!s && co == SL) {
+        /* print from where no script is: nowhere to go */
+    } else {
+        report(NULL, FALSE, lua_tostring(co, -1));
+    }
     return 0;
 }
 
@@ -261,12 +468,14 @@ static gboolean sleep_done(gpointer data)
 static int l_sleep(lua_State *co)
 {
     double seconds = luaL_checknumber(co, 1);
+    can_wait(co);
     g_timeout_add((guint)(MAX(seconds, 0) * 1000), sleep_done, script_of(co));
     return wait_for(co);
 }
 
 static int l_quit(lua_State *co)
 {
+    deny_sandboxed(co, "vimb.quit");
     vb_exit((int)luaL_optinteger(co, 1, 0));
     return wait_for(co);            /* and is never resumed */
 }
@@ -306,6 +515,9 @@ static void resume_open(gboolean ok, const char *error, JsonNode *value, gpointe
     Script *s     = call->script;
     Client *c     = ops_find_tab(call->tab);
     g_free(call);
+    if (ok && s->sandboxed && value && s->policy.learn && !s->cancelled) {
+        s->policy.learn(value, s->policy.data);
+    }
     if (ok && c) {
         push_tab(s->co, c);
         push_json(s->co, value);
@@ -324,6 +536,7 @@ static void resume_open(gboolean ok, const char *error, JsonNode *value, gpointe
 
 static int open_in(lua_State *co, Client *c, const char *url, int options)
 {
+    can_wait(co);
     TabCall *call = g_new0(TabCall, 1);
     call->script  = script_of(co);
     call->tab     = ops_tab_id(c);
@@ -335,6 +548,8 @@ static int open_in(lua_State *co, Client *c, const char *url, int options)
 static int l_open(lua_State *co)
 {
     const char *url = luaL_checkstring(co, 1);
+    can_wait(co);
+    check_url(co, url);
     Client *c       = vb_tab_new(NULL, NULL, TRUE);
     return open_in(co, c, url, 2);
 }
@@ -350,8 +565,11 @@ static int l_archive_start(lua_State *co)
     }
     GError *error = NULL;
     Client *c     = vb_get_current_client();
-    struct Archive *a = c ? archiving_create(c, name, opt_tristate(co, 1, "strict_ssl"),
-            opt_tristate(co, 1, "allow_internal"), &error) : NULL;
+    Script *s     = script_of(co);
+    /* a sandboxed script's archive follows the settings, whatever it asks */
+    gboolean own  = s && !s->sandboxed;
+    struct Archive *a = c ? archiving_create(c, name, own ? opt_tristate(co, 1, "strict_ssl") : -1,
+            own ? opt_tristate(co, 1, "allow_internal") : -1, &error) : NULL;
     if (!a) {
         lua_pushnil(co);
         lua_pushstring(co, error ? error->message : "no tab to start from");
@@ -372,37 +590,49 @@ static int l_tab_load(lua_State *co)
 {
     Client *c       = check_tab(co, 1);
     const char *url = luaL_checkstring(co, 2);
+    can_wait(co);
+    check_url(co, url);
     ops_load(c, url, opt_number(co, 3, "timeout", 60), resume_value, script_of(co));
     return wait_for(co);
 }
 
 static int l_tab_scroll(lua_State *co)
 {
-    ops_scroll(check_tab(co, 1), resume_value, script_of(co));
+    Client *c = check_tab(co, 1);
+    can_wait(co);
+    ops_scroll(c, resume_value, script_of(co));
     return wait_for(co);
 }
 
 static int l_tab_text(lua_State *co)
 {
-    ops_text(check_tab(co, 1), resume_value, script_of(co));
+    Client *c = check_tab(co, 1);
+    can_wait(co);
+    ops_text(c, resume_value, script_of(co));
     return wait_for(co);
 }
 
 static int l_tab_html(lua_State *co)
 {
-    ops_html(check_tab(co, 1), resume_value, script_of(co));
+    Client *c = check_tab(co, 1);
+    can_wait(co);
+    ops_html(c, resume_value, script_of(co));
     return wait_for(co);
 }
 
 static int l_tab_source(lua_State *co)
 {
-    ops_source(check_tab(co, 1), resume_value, script_of(co));
+    Client *c = check_tab(co, 1);
+    can_wait(co);
+    ops_source(c, resume_value, script_of(co));
     return wait_for(co);
 }
 
 static int l_tab_links(lua_State *co)
 {
-    ops_links(check_tab(co, 1), resume_value, script_of(co));
+    Client *c = check_tab(co, 1);
+    can_wait(co);
+    ops_links(c, resume_value, script_of(co));
     return wait_for(co);
 }
 
@@ -410,6 +640,8 @@ static int l_tab_eval(lua_State *co)
 {
     Client *c          = check_tab(co, 1);
     const char *script = luaL_checkstring(co, 2);
+    deny_sandboxed(co, "t:eval");
+    can_wait(co);
     ops_eval(c, script, resume_value, script_of(co));
     return wait_for(co);
 }
@@ -464,6 +696,8 @@ static int l_archive_open(lua_State *co)
 {
     struct Archive *a = check_archive(co, 1);
     const char *url   = luaL_checkstring(co, 2);
+    can_wait(co);
+    check_url(co, url);
     Client *c         = vb_tab_new_archive(a, NULL);
     if (!c) {
         lua_pushnil(co);
@@ -489,6 +723,7 @@ static void resume_saved(const char *path, const char *error, gpointer data)
 /* a:stop() -> path of the WACZ | nil, error */
 static int l_archive_stop(lua_State *co)
 {
+    can_wait(co);
     archiving_stop_async(check_archive(co, 1), resume_saved, script_of(co));
     return wait_for(co);
 }
@@ -611,6 +846,29 @@ static int l_archive_crawl(lua_State *co)
         g_ptr_array_free(seeds, TRUE);
         return luaL_error(co, "a crawl needs seeds={...} or seed=");
     }
+    Script *s = script_of(co);
+    if (s && s->sandboxed) {
+        for (guint i = 0; i < seeds->len; i++) {
+            char *why = NULL;
+            if (!s->policy.url_check(g_ptr_array_index(seeds, i), &why, s->policy.data)) {
+                lua_pushstring(co, why ? why : "not allowed");
+                g_free(why);
+                g_ptr_array_free(seeds, TRUE);
+                return lua_error(co);
+            }
+        }
+        lua_getfield(co, 2, "on_page");
+        gboolean on_page = !lua_isnil(co, -1);
+        lua_pop(co, 1);
+        if (on_page) {
+            g_ptr_array_free(seeds, TRUE);
+            return luaL_error(co, "on_page isn't available to this script");
+        }
+    }
+    if (!lua_isyieldable(co) || !s) {
+        g_ptr_array_free(seeds, TRUE);
+        return luaL_error(co, "can't wait here (inside a callback or a metamethod)");
+    }
     g_ptr_array_add(seeds, NULL);
 
     lua_getfield(co, 2, "scope");
@@ -697,23 +955,24 @@ static int l_archive_gc(lua_State *co)
 
 /* ---- setting up -------------------------------------------------------- */
 
-static void new_class(const char *meta, const luaL_Reg *methods, lua_CFunction index,
-        lua_CFunction gc)
+static void new_class(lua_State *state, const char *meta, const luaL_Reg *methods,
+        lua_CFunction index, lua_CFunction gc)
 {
-    luaL_newmetatable(L, meta);
-    lua_newtable(L);
-    luaL_setfuncs(L, methods, 0);
-    lua_setfield(L, -2, "methods");
-    lua_pushcfunction(L, index);
-    lua_setfield(L, -2, "__index");
+    luaL_newmetatable(state, meta);
+    lua_newtable(state);
+    luaL_setfuncs(state, methods, 0);
+    lua_setfield(state, -2, "methods");
+    lua_pushcfunction(state, index);
+    lua_setfield(state, -2, "__index");
     if (gc) {
-        lua_pushcfunction(L, gc);
-        lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(state, gc);
+        lua_setfield(state, -2, "__gc");
     }
-    lua_pop(L, 1);
+    lua_pop(state, 1);
 }
 
-static void init(void)
+/* The vimb table, and the classes of tabs and archives, in a state. */
+static void add_vimb(lua_State *state)
 {
     static const luaL_Reg tab_methods[] = {
         {"load", l_tab_load}, {"scroll", l_tab_scroll}, {"text", l_tab_text},
@@ -730,46 +989,165 @@ static void init(void)
         {"tabs", l_tabs}, {"open", l_open}, {NULL, NULL}
     };
 
-    L = luaL_newstate();
-    luaL_openlibs(L);
-    new_class(TAB_META, tab_methods, l_tab_index, NULL);
-    new_class(ARCHIVE_META, archive_methods, l_archive_index, l_archive_gc);
+    new_class(state, TAB_META, tab_methods, l_tab_index, NULL);
+    new_class(state, ARCHIVE_META, archive_methods, l_archive_index, l_archive_gc);
 
-    lua_newtable(L);
-    luaL_setfuncs(L, vimb_functions, 0);
-    lua_newtable(L);
-    lua_pushcfunction(L, l_archive_start);
-    lua_setfield(L, -2, "start");
-    lua_setfield(L, -2, "archive");
-    lua_pushstring(L, VERSION);
-    lua_setfield(L, -2, "version");
-    lua_pushboolean(L, vb.scripted);
-    lua_setfield(L, -2, "scripted");
-    lua_setglobal(L, "vimb");
+    lua_newtable(state);
+    luaL_setfuncs(state, vimb_functions, 0);
+    lua_newtable(state);
+    lua_pushcfunction(state, l_archive_start);
+    lua_setfield(state, -2, "start");
+    lua_setfield(state, -2, "archive");
+    lua_pushstring(state, VERSION);
+    lua_setfield(state, -2, "version");
+    lua_pushboolean(state, vb.scripted);
+    lua_setfield(state, -2, "scripted");
+    lua_setglobal(state, "vimb");
 }
 
-/* Makes a script of the chunk on top of L's stack, and starts it. */
-static void start(int load_status, const char *name, gboolean exit_when_done, Client *c)
+static void init(void)
+{
+    L = luaL_newstate();
+    *(Script **)lua_getextraspace(L) = NULL;
+    luaL_openlibs(L);
+    add_vimb(L);
+}
+
+/* The instruction budget: a sandboxed script that runs on and on without
+ * waiting would hold up the browser. */
+static void sandbox_hook(lua_State *co, lua_Debug *ar)
+{
+    Script *s = script_of(co);
+    if (s && (s->steps += SANDBOX_HOOK_EVERY) > SANDBOX_STEPS) {
+        luaL_error(co, "the script ran too long without waiting");
+    }
+}
+
+/* The sandboxed scripts' memory, limited. */
+static void *sandbox_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
+{
+    if (!nsize) {
+        sandbox_memory -= ptr ? osize : 0;
+        free(ptr);
+        return NULL;
+    }
+    size_t was = ptr ? osize : 0;
+    if (sandbox_enforce && nsize > was && sandbox_memory + (nsize - was) > SANDBOX_MEMORY) {
+        return NULL;
+    }
+    void *grown = realloc(ptr, nsize);
+    if (grown) {
+        sandbox_memory = sandbox_memory - was + nsize;
+    }
+    return grown;
+}
+
+static void init_sandbox(void)
+{
+    static const char *unsafe[] = {"dofile", "loadfile", "load", "require", "collectgarbage", NULL};
+    static const char *os_kept[] = {"clock", "date", "difftime", "time", NULL};
+    static const luaL_Reg libraries[] = {
+        {LUA_GNAME, luaopen_base}, {LUA_STRLIBNAME, luaopen_string},
+        {LUA_TABLIBNAME, luaopen_table}, {LUA_MATHLIBNAME, luaopen_math},
+        {LUA_UTF8LIBNAME, luaopen_utf8}, {LUA_OSLIBNAME, luaopen_os}, {NULL, NULL}
+    };
+    SL = lua_newstate(sandbox_alloc, NULL);
+    *(Script **)lua_getextraspace(SL) = NULL;
+    for (const luaL_Reg *lib = libraries; lib->func; lib++) {
+        luaL_requiref(SL, lib->name, lib->func, 1);
+        lua_pop(SL, 1);
+    }
+    for (int i = 0; unsafe[i]; i++) {
+        lua_pushnil(SL);
+        lua_setglobal(SL, unsafe[i]);
+    }
+    /* of os, only the clock */
+    lua_getglobal(SL, LUA_OSLIBNAME);
+    lua_newtable(SL);
+    for (int i = 0; os_kept[i]; i++) {
+        lua_getfield(SL, -2, os_kept[i]);
+        lua_setfield(SL, -2, os_kept[i]);
+    }
+    lua_setglobal(SL, LUA_OSLIBNAME);
+    lua_pop(SL, 1);
+    lua_pushcfunction(SL, l_log);   /* print goes to the log, not stdout */
+    lua_setglobal(SL, "print");
+    add_vimb(SL);
+}
+
+LuaRun *luascript_run_sandboxed(const char *code, const LuaPolicy *policy, LuaRunDone done,
+        gpointer data)
+{
+    if (!SL) {
+        init_sandbox();
+    }
+    Script *s    = g_new0(Script, 1);
+    s->sandboxed = TRUE;
+    s->policy    = *policy;
+    s->done      = done;
+    s->done_data = data;
+    s->log       = g_string_new(NULL);
+    /* text only: compiled chunks can do what text can't */
+    int status = luaL_loadbufferx(SL, code, strlen(code), "=script", "t");
+    start_on(SL, s, status, "script", FALSE, NULL);
+    return s;
+}
+
+void luascript_cancel(LuaRun *run)
+{
+    run->cancelled = TRUE;
+}
+
+/* Makes a script of the chunk on top of main's stack (s, or a new one), and
+ * starts it. */
+static void start_on(lua_State *main, Script *s, int load_status, const char *name,
+        gboolean exit_when_done, Client *c)
 {
     if (load_status != LUA_OK) {
-        char *text = g_strdup_printf("vimb: %s", lua_tostring(L, -1));
+        if (s) {
+            /* the error goes to whoever ran it, as a failure does */
+            s->main = main;
+            s->co   = main;
+            g_free(s->name);
+            s->name = g_strdup(name);
+            char *message = g_strdup(lua_tostring(main, -1));
+            lua_pop(main, 1);
+            s->done(FALSE, message, NULL, "", s->done_data);
+            g_free(message);
+            g_string_free(s->log, TRUE);
+            g_free(s->name);
+            g_free(s);
+            return;
+        }
+        char *text = g_strdup_printf("vimb: %s", lua_tostring(main, -1));
         report(c, TRUE, text);
         g_free(text);
-        lua_pop(L, 1);
+        lua_pop(main, 1);
         if (exit_when_done) {
             vb_exit(1);
         }
         return;
     }
-    Script *s         = g_new0(Script, 1);
+    if (!s) {
+        s = g_new0(Script, 1);
+    }
     s->name           = g_strdup(name);
     s->exit_when_done = exit_when_done;
-    s->co             = lua_newthread(L);
+    s->main           = main;
+    s->co             = lua_newthread(main);
     *(Script **)lua_getextraspace(s->co) = s;
-    lua_insert(L, -2);                  /* thread below the chunk */
-    lua_xmove(L, s->co, 1);             /* the chunk onto the thread */
-    s->ref = luaL_ref(L, LUA_REGISTRYINDEX);  /* the thread */
+    lua_insert(main, -2);               /* thread below the chunk */
+    lua_xmove(main, s->co, 1);          /* the chunk onto the thread */
+    s->ref = luaL_ref(main, LUA_REGISTRYINDEX);  /* the thread */
+    if (s->sandboxed) {
+        lua_sethook(s->co, sandbox_hook, LUA_MASKCOUNT, SANDBOX_HOOK_EVERY);
+    }
     script_resume(s, 0);
+}
+
+static void start(int load_status, const char *name, gboolean exit_when_done, Client *c)
+{
+    start_on(L, NULL, load_status, name, exit_when_done, c);
 }
 
 void luascript_run_file(Client *c, const char *path, gboolean exit_when_done)

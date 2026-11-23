@@ -49,7 +49,7 @@ def run(backend, tmp):
     try:
         done = subprocess.run([VIMB, "--window-size", "1280x900",
                                "-C", f"set archive-allow-internal=true|set assistant={backend}",
-                               "--assistant-task",
+                               "--assistant-scripts", "--assistant-task",
                                f"Archive {SITE}index.html and the page it links to as A."],
                               env=env, capture_output=True, text=True, timeout=180)
     finally:
@@ -66,7 +66,7 @@ def run(backend, tmp):
     entries = [json.loads(line) for line in open(log)] if os.path.exists(log) else []
     if backend != "pi":
         check(f"{backend}: the overloaded API was tried again",
-              entries and entries[0].get("answer") in (503, 529) and len(entries) == 8,
+              entries and entries[0].get("answer") in (503, 529) and len(entries) == 9,
               f"{len(entries)} requests")
     problems = [p for e in entries for p in e["problems"]]
     check(f"{backend}: the stand-in found nothing wrong", entries and not problems,

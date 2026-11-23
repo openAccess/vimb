@@ -84,9 +84,57 @@ class Scenario:
             st["saved"] = saved
             if not saved.endswith(".wacz"):
                 problems.append(f"stop_archive failed: {res(8)}")
-            return [("text", f"Saved the archive to {saved}.")], "end_turn"
+            # scripts: one that works, and tries what it mustn't; one that
+            # never waits; one that eats memory
+            script = SCRIPT.replace("SITE", site)
+            return [call(9, "run_lua", {"code": script, "description": "reads page B"}),
+                    call(10, "run_lua", {"code": "while true do end", "description": "spins"}),
+                    call(11, "run_lua", {"code": "local t = {} for i = 1, 1e9 do "
+                                         "t[i] = ('x'):rep(4096) .. i end", "description": "eats"})], "tool_use"
+        if turn == 7:
+            error, text = res(9)
+            got = _json(text) if not error else {}
+            want = {"io": True, "osexec": True, "load": True, "require": True, "status": 200,
+                    "refused": True, "noeval": True, "noquit": True, "learned": True}
+            value = got.get("value") or {}
+            for key, expected in want.items():
+                if value.get(key) != expected:
+                    problems.append(f"script: {key} is {value.get(key)!r}, not {expected!r} ({text[:300]})")
+            if value.get("links", 0) < 1 or "hello from the script" not in got.get("log", ""):
+                problems.append(f"script: links or log wrong: {text[:300]}")
+            error, text = res(10)
+            if not error or "too long" not in text:
+                problems.append(f"the endless script wasn't stopped: {res(10)}")
+            error, text = res(11)
+            if not error or "memory" not in text:
+                problems.append(f"the hungry script wasn't stopped: {res(11)}")
+            return [("text", f"Saved the archive to {st['saved']}.")], "end_turn"
         problems.append("the conversation went on too long")
         return [("text", "Done.")], "end_turn"
+
+
+# What a script may and mayn't do. b.html was among the index's links, so
+# it may be opened; a URL made up in the script may not; nor may a link of
+# b.html's be opened before the script has read it.
+SCRIPT = """
+local r = {}
+r.io, r.osexec, r.load, r.require = io == nil, os.execute == nil, load == nil, require == nil
+local t, info = vimb.open("SITEb.html")
+r.status = info and info.status
+local ok, err = pcall(t.load, t, "http://127.0.0.1:9445/collect?x=" .. t.title)
+r.refused = not ok and tostring(err):find("didn't come from") ~= nil
+r.noeval = not pcall(t.eval, t, "1")
+r.noquit = not pcall(vimb.quit)
+local links = t:links()
+r.links = #links
+-- a link read by the script may be opened by it
+local found = nil
+for _, l in ipairs(links) do if l:find("/d.html") then found = l end end
+r.learned = found ~= nil and t:load(found) ~= nil
+vimb.log("hello from the script")
+t:close()
+return r
+"""
 
 
 def _json(text):

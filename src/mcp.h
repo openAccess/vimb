@@ -29,9 +29,16 @@
  * vimb prints can get into the stream. When in_fd closes, the archives the
  * tools started are saved and vimb quits.
  *
- * The protocol versions served are those of the initialize handshake,
- * 2024-11-05 to 2025-11-25. */
+ * The protocol versions served, by either transport, are those of the
+ * initialize handshake, 2024-11-05 to 2025-11-25. */
 
 gboolean mcp_serve_stdio(int in_fd, int out_fd, const ToolPolicy *policy, GError **error);
+
+/* Over HTTP (vimb --mcp-http PORT): MCP's streamable HTTP transport at
+ * http://127.0.0.1:PORT/mcp, served to this user's programs only -- the
+ * kernel is asked whose the connection is -- and not to web pages (by Origin
+ * and Host). Each client has a session, begun by initialize; a tool's call
+ * answers as server-sent events, kept alive while it runs. Linux only. */
+gboolean mcp_serve_http(guint port, const ToolPolicy *policy, GError **error);
 
 #endif /* end of include guard: _MCP_H */

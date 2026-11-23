@@ -31,6 +31,12 @@
  * instead, through /proc/net/tcp. Elsewhere than Linux this says yes. */
 gboolean archive_peer_is_same_user(GSocketConnection *connection);
 
+/* The same, for a connection known by its addresses: ours, and the peer's. */
+gboolean archive_peer_addresses_same_user(GSocketAddress *local, GSocketAddress *remote);
+
+/* Whether the check above can tell at all, rather than always saying yes. */
+gboolean archive_peer_check_works(void);
+
 /* Whether a page must not reach address through the archiving proxy unless
  * that is allowed: loopback, private and link-local networks (which hold
  * cloud metadata services), carrier-grade NAT, unique-local IPv6, and the

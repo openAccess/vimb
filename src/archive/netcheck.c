@@ -68,28 +68,41 @@ static long owner_in_table(const char *path, guint16 peer_port, guint16 our_port
 }
 #endif
 
-gboolean archive_peer_is_same_user(GSocketConnection *connection)
+gboolean archive_peer_addresses_same_user(GSocketAddress *local, GSocketAddress *remote)
 {
 #ifdef __linux__
-    GSocketAddress *local  = g_socket_connection_get_local_address(connection, NULL);
-    GSocketAddress *remote = g_socket_connection_get_remote_address(connection, NULL);
-    gboolean same          = FALSE;
-
-    if (G_IS_INET_SOCKET_ADDRESS(local) && G_IS_INET_SOCKET_ADDRESS(remote)) {
-        guint16 our_port  = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(local));
-        guint16 peer_port = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(remote));
-        long uid = owner_in_table("/proc/net/tcp", peer_port, our_port);
-        if (uid < 0) {
-            uid = owner_in_table("/proc/net/tcp6", peer_port, our_port);
-        }
-        same = uid >= 0 && (uid_t)uid == getuid();
+    if (!G_IS_INET_SOCKET_ADDRESS(local) || !G_IS_INET_SOCKET_ADDRESS(remote)) {
+        return FALSE;
     }
-    g_clear_object(&local);
-    g_clear_object(&remote);
-    return same;
+    guint16 our_port  = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(local));
+    guint16 peer_port = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(remote));
+    long uid = owner_in_table("/proc/net/tcp", peer_port, our_port);
+    if (uid < 0) {
+        uid = owner_in_table("/proc/net/tcp6", peer_port, our_port);
+    }
+    return uid >= 0 && (uid_t)uid == getuid();
 #else
     return TRUE;
 #endif
+}
+
+gboolean archive_peer_check_works(void)
+{
+#ifdef __linux__
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+gboolean archive_peer_is_same_user(GSocketConnection *connection)
+{
+    GSocketAddress *local  = g_socket_connection_get_local_address(connection, NULL);
+    GSocketAddress *remote = g_socket_connection_get_remote_address(connection, NULL);
+    gboolean same          = archive_peer_addresses_same_user(local, remote);
+    g_clear_object(&local);
+    g_clear_object(&remote);
+    return same;
 }
 
 static gboolean ipv4_is_internal(const guint8 *b)

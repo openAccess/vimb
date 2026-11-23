@@ -314,8 +314,10 @@ struct Vimb {
     int         exit_status;
     GtkWidget   *paned;             /* the tabs, and beside them the assistant */
     char        *assistant_task;    /* --assistant-task: given the assistant, then quit */
+    gboolean    assistant_scripts;  /* --assistant-scripts: its scripts run unasked */
     gboolean    mcp;                /* --mcp: serve MCP on stdin and stdout */
     int         mcp_out;            /* stdout, kept for MCP; fd 1 is stderr then */
+    int         mcp_http;           /* --mcp-http: serve MCP over HTTP on this port */
     gboolean    mcp_allow_eval;
     char        *mcp_allow_domains;
     int         window_width;       /* --window-size, or 0 */

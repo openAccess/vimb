@@ -22,10 +22,12 @@
 
 #include "archiving.h"
 #include "crawl.h"
+#include "luascript.h"
 #include "ops.h"
 #include "tools.h"
 
 #define DEFAULT_READ_LIMIT 50000
+#define SCRIPT_RESULT_MAX  100000
 #define DEFAULT_TIMEOUT    60
 
 extern struct Vimb vb;
@@ -39,6 +41,7 @@ typedef struct {
     const char *schema;
     ToolFunc   run;
     gboolean   needs_eval;
+    gboolean   needs_lua;
 } Tool;
 
 struct Call {
@@ -53,7 +56,10 @@ struct Call {
     char             *format;   /* read_page */
     gint64           offset;
     gint64           limit;
+    LuaRun           *script;   /* run_lua */
 };
+
+static GList *scripts;              /* the Calls whose scripts run */
 
 /* ---- numbering tabs and archives --------------------------------------- */
 
@@ -596,6 +602,85 @@ static void tool_crawl(Call *call)
     g_ptr_array_free(seeds, TRUE);
 }
 
+/* ---- scripts ------------------------------------------------------------ */
+
+static gboolean script_url_check(const char *url, char **why, gpointer data)
+{
+    return url_allowed(data, url, why);
+}
+
+static void script_learn(JsonNode *value, gpointer data)
+{
+    Call *call = data;
+    if (call->policy->learn) {
+        call->policy->learn(value, call->policy->url_check_data);
+    }
+}
+
+static void script_done(gboolean ok, const char *error, JsonNode *value, const char *log,
+        gpointer data)
+{
+    Call *call = data;
+    scripts = g_list_remove(scripts, call);
+    call->script = NULL;
+    if (!ok) {
+        call_fail(call, "the script failed: %s%s%s", error, log && *log ? "\nIt logged:\n" : "",
+                log ? log : "");
+        return;
+    }
+    JsonObject *o = json_object_new();
+    char *text = value ? json_to_string(value, FALSE) : NULL;
+    if (text && strlen(text) > SCRIPT_RESULT_MAX) {
+        char *cut = g_strdup_printf("%.*s... (cut: %zu characters in all)", SCRIPT_RESULT_MAX,
+                text, strlen(text));
+        json_object_set_string_member(o, "value", cut);
+        g_free(cut);
+    } else {
+        json_object_set_member(o, "value", value ? json_node_copy(value) : json_node_new(JSON_NODE_NULL));
+    }
+    g_free(text);
+    json_object_set_string_member(o, "log", log ? log : "");
+    call_ok(call, object_node(o));
+}
+
+static void script_approved(gboolean yes, gpointer data)
+{
+    Call *call = data;
+    if (!yes) {
+        call_fail(call, "the person didn't let the script run");
+        return;
+    }
+    LuaPolicy policy = {.url_check = script_url_check, .learn = script_learn, .data = call};
+    scripts = g_list_prepend(scripts, call);
+    LuaRun *run = luascript_run_sandboxed(arg_string(call, "code"), &policy, script_done, call);
+    /* a script that never waits is done -- and call with it -- already */
+    if (g_list_find(scripts, call)) {
+        call->script = run;
+    }
+}
+
+static void tool_run_lua(Call *call)
+{
+    const char *code = arg_string(call, "code");
+    if (!code || !*code) {
+        call_fail(call, "say what code to run");
+        return;
+    }
+    const char *description = arg_string(call, "description");
+    call->policy->approve_lua(code, description ? description : "", script_approved, call,
+            call->policy->url_check_data);
+}
+
+void tools_cancel_scripts(void)
+{
+    for (GList *l = scripts; l; l = l->next) {
+        Call *call = l->data;
+        if (call->script) {
+            luascript_cancel(call->script);
+        }
+    }
+}
+
 #define TAB "\"tab\": {\"type\": \"integer\", \"description\": \"The tab, by its number.\"}"
 #define ARCHIVE "\"archive\": {\"type\": \"integer\", \"description\": \"The archive, by its number.\"}"
 
@@ -658,13 +743,29 @@ static const Tool tools[] = {
         "\"max_seconds\": {\"type\": \"number\"}, \"delay\": {\"type\": \"number\"}, "
         "\"scroll\": {\"type\": \"boolean\"}}, \"required\": [\"archive\", \"seeds\"]}",
         tool_crawl, FALSE},
+    {"run_lua", "Run a Lua 5.4 script in the browser, once the person has approved it -- for work "
+        "that would take the other tools many calls, such as visiting pages in a loop. It has "
+        "string, table, math, utf8, os.time/clock/date, and the vimb table: vimb.log(...), "
+        "vimb.sleep(seconds), vimb.tab(), vimb.tabs(), vimb.open(url) -> tab, info; "
+        "vimb.archive.start(name) -> a; a:open(url) -> tab, info; a:crawl{seeds={...}, scope=, "
+        "depth=, max_pages=, delay=} -> summary; a:stop() -> where it was saved; t:load(url) -> "
+        "info; t:scroll(); t:text(); t:html(); t:source(); t:links() -> URLs; t:close(); t.url, "
+        "t.title, t.status. Calls that fail return nil and why. The URLs it opens are held to "
+        "the same rule as yours. What it logs and returns comes back to you; an archive it "
+        "doesn't stop is saved once its tabs are closed.",
+        "{\"type\": \"object\", \"properties\": {"
+        "\"code\": {\"type\": \"string\"}, "
+        "\"description\": {\"type\": \"string\", \"description\": \"In a sentence, what "
+        "the script does, for the person deciding whether to let it run.\"}}, "
+        "\"required\": [\"code\", \"description\"]}", tool_run_lua, FALSE, TRUE},
 };
 
 JsonNode *tools_list(const ToolPolicy *policy)
 {
     JsonArray *list = json_array_new();
     for (gsize i = 0; i < G_N_ELEMENTS(tools); i++) {
-        if (tools[i].needs_eval && !policy->allow_eval) {
+        if ((tools[i].needs_eval && !policy->allow_eval)
+                || (tools[i].needs_lua && !policy->approve_lua)) {
             continue;
         }
         JsonObject *o = json_object_new();
@@ -695,7 +796,8 @@ void tools_call(const char *name, JsonObject *arguments, const ToolPolicy *polic
     call->done   = done;
     call->data   = data;
     for (gsize i = 0; i < G_N_ELEMENTS(tools); i++) {
-        if (!strcmp(tools[i].name, name) && (!tools[i].needs_eval || policy->allow_eval)) {
+        if (!strcmp(tools[i].name, name) && (!tools[i].needs_eval || policy->allow_eval)
+                && (!tools[i].needs_lua || policy->approve_lua)) {
             call->tool = &tools[i];
             tools[i].run(call);
             return;
