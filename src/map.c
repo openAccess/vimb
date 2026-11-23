@@ -535,7 +535,9 @@ static gboolean do_timeout(Client *c)
     /* consume any unprocessed events */
     process_events();
 
-    return TRUE;
+    /* Done: with its id cleared, a source left running could no longer be
+     * removed -- and would fire on a client freed by closing its tab. */
+    return G_SOURCE_REMOVE;
 }
 
 static void free_map(Map *map)
