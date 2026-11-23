@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `resume`, `name` and `status`, and the settings `archive-dir` and
   `archive-allow-internal`. Archives cut off by a crash are saved on the next
   start.
+* Lua scripting: `--script FILE` runs a script and quits with its status,
+  and `:lua` and `:luafile` run Lua. Scripts open pages and wait for them,
+  read them (text, live HTML, the HTML as sent, links, JavaScript in a world
+  of its own), read them to their ends, archive them and crawl them within a
+  scope (`a:crawl{...}`). While a script runs, dialogs, permission requests
+  and sign-in requests answer themselves. `--window-size WIDTHxHEIGHT` sets
+  the window's size.
 
 ## Changed
 * Use webkit's built-in user-agent as default for setting `user-agent`

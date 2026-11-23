@@ -64,6 +64,23 @@ Print build and version information and then quit.
 .B "\-\-no-maximize"
 Do no attempt to maximize window.
 .TP
+.BI "\-\-script " FILE
+Run the Lua script \fIFILE\fP (see \fBScripting\fP), then quit: with status
+0 when the script ends, or 1 if it fails.
+While a script runs, nobody is taken to be at the keyboard: a page's alerts
+are dismissed, its confirms declined and its prompts left unanswered,
+permission requests are denied and sign-in requests cancelled.
+To run without a display, run vimb under a virtual one:
+.sp
+.EX
+Xvfb :9 & DISPLAY=:9 GDK_BACKEND=x11 vimb --window-size 1280x900 --script crawl.lua
+.EE
+.TP
+.BI "\-\-window-size " WIDTHxHEIGHT
+Open the window this size, and don't maximize it.
+What a page lays out, and so what it loads, depends on the size it is shown
+at.
+.TP
 .B "\-\-bug-info"
 Prints information about used libraries for bug reports and then quit.
 .
@@ -700,6 +717,96 @@ These commands act on the archive of the current tab, or on the one archive
 being recorded.
 An archive is kept as loose files until it is saved, so that nothing is lost
 if vimb crashes: on its next start, vimb saves what it finds.
+.
+.SS Scripting
+Lua scripts can drive vimb: open pages and wait for them, read them, archive
+them and crawl.
+A call that has to wait \(em for a page to load, say \(em suspends the script
+until it is done, while vimb goes on.
+A call that fails returns \fBnil\fP and why, as Lua's own do.
+.TP
+.BI ":lua " code
+Run the Lua \fIcode\fP.
+.TP
+.BI ":luafile " file
+Run the Lua script in \fIfile\fP.
+.PP
+The \fBvimb\fP table:
+.TP
+.BI vimb.log( ... )
+Print the values, and show them in the status bar.
+.TP
+.BI vimb.sleep( seconds )
+Wait.
+.TP
+.BI vimb.quit([ status ])
+Quit vimb.
+.TP
+.B vimb.tab(), vimb.tabs()
+The current tab; all tabs.
+.TP
+.BI vimb.open( url " [, {timeout=" seconds "}])"
+Open \fIurl\fP in a new tab, not archived; returns the tab and what loaded:
+{url, status, title}.
+.TP
+.BI vimb.archive.start([ name " | {name=, strict_ssl=, allow_internal=}])"
+Start an archive (see \fBArchiving\fP), without a tab; it is saved when the
+script stops it, or when vimb quits.
+.PP
+An archive \fIa\fP:
+.TP
+.BI a:open( url " [, {timeout=" seconds "}])"
+Open \fIurl\fP in a new archiving tab; returns the tab and what loaded, or
+\fBnil\fP, why, and the tab.
+.TP
+.BI a:crawl{ options }
+Visit pages from \fBseed\fP= (or \fBseeds\fP={...}) outward, following links in
+\fBscope\fP= `host' (the default), `site', `page-links' (the links on the
+seeds), `pattern' (URLs matching \fBpattern\fP=) or `any', \fBdepth\fP= links
+away (1), up to \fBmax_pages\fP= (100) and \fBmax_seconds\fP=, waiting
+\fBdelay\fP= seconds between pages from one host (1), each read to its end
+unless \fBscroll\fP=false.
+\fBlog\fP=true prints each page; \fBon_page\fP= is called with each, and may not
+wait.
+Returns {pages, loaded, failed, left, seconds, stopped}.
+.TP
+.B a:stop()
+Save the archive; returns where.
+.TP
+.B a:pause(), a:resume(), a:rename(\fIname\fP)
+.TP
+.B a.name, a.state, a.responses, a.saved
+.PP
+A tab \fIt\fP:
+.TP
+.BI t:load( url " [, {timeout=" seconds "}])"
+Load \fIurl\fP and wait; returns what loaded.
+.TP
+.B t:scroll()
+Read the page to its end, so that what loads as it is read loads; returns
+{screens, reached_end}.
+.TP
+.B t:text(), t:html(), t:source(), t:links()
+The page's text; its HTML as it is now; its HTML as the server sent it; its
+links.
+.TP
+.BI t:eval( javascript )
+Run \fIjavascript\fP in the page, in a world of its own that the page's
+scripts can't see, and return its value.
+.TP
+.B t:close()
+.TP
+.B t.url, t.title, t.status, t.archiving, t.closed
+.PP
+For example:
+.sp
+.EX
+local a = vimb.archive.start("news")
+local t = a:open("https://example.com/")
+for _, url in ipairs(t:links()) do t:load(url); t:scroll() end
+a:crawl{seed = "https://example.org/", scope = "site", depth = 2}
+vimb.log("saved", a:stop())
+.EE
 .
 .SS Handlers
 Handlers allow specifying external scripts to handle alternative URI methods.

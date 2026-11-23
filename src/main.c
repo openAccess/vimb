@@ -42,6 +42,8 @@
 #include "completion.h"
 #include "ex.h"
 #include "archiving.h"
+#include "luascript.h"
+#include "ops.h"
 #include "ext-proxy.h"
 #include "handler.h"
 #include "history.h"
@@ -109,6 +111,8 @@ static void on_webview_web_process_terminated(WebKitWebView *webview,
         WebKitWebProcessTerminationReason reason, Client *c);
 static gboolean on_webview_authenticate(WebKitWebView *webview,
         WebKitAuthenticationRequest *request, Client *c);
+static gboolean on_webview_script_dialog(WebKitWebView *webview, WebKitScriptDialog *dialog,
+        Client *c);
 static gboolean on_webview_enter_fullscreen(WebKitWebView *webview, Client *c);
 static gboolean on_webview_leave_fullscreen(WebKitWebView *webview, Client *c);
 /* GTK4: close-request signal doesn't take GdkEvent parameter */
@@ -163,6 +167,17 @@ static gboolean signal_handler_cb(gpointer user_data)
         g_main_loop_quit(main_loop);
     }
     return G_SOURCE_REMOVE;
+}
+
+/**
+ * Quit vimb with the given exit status -- for a script that has finished.
+ */
+void vb_exit(int status)
+{
+    vb.exit_status = status;
+    if (main_loop && g_main_loop_is_running(main_loop)) {
+        g_main_loop_quit(main_loop);
+    }
 }
 
 /**
@@ -1933,6 +1948,11 @@ static void on_webview_web_process_terminated(WebKitWebView *webview,
 static gboolean on_webview_authenticate(WebKitWebView *webview,
         WebKitAuthenticationRequest *request, Client *c)
 {
+    /* With nobody at the keyboard, there is nobody to sign in. */
+    if (vb.scripted) {
+        webkit_authentication_request_cancel(request);
+        return TRUE;
+    }
     /* Don't change the mode if we are in pass through mode. */
     if (c->mode->id == 'n') {
         vb_enter(c, 'i');
@@ -2306,8 +2326,12 @@ static void create_main_window(void)
     /* Create the main window */
     vb.main_window = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(vb.main_window), PROJECT_UCFIRST);
-    gtk_window_set_default_size(GTK_WINDOW(vb.main_window), WIN_WIDTH, WIN_HEIGHT);
-    if (!vb.no_maximize) {
+    gtk_window_set_default_size(GTK_WINDOW(vb.main_window),
+            vb.window_width ? vb.window_width : WIN_WIDTH,
+            vb.window_height ? vb.window_height : WIN_HEIGHT);
+    /* A size asked for is kept: without a window manager, as under Xvfb,
+     * nothing would maximize the window anyway. */
+    if (!vb.no_maximize && !vb.window_width) {
         gtk_window_maximize(GTK_WINDOW(vb.main_window));
     }
 
@@ -2663,6 +2687,7 @@ void vb_tab_close(Client *c)
         return;
     }
 
+    ops_tab_closed(c);
     if (c->archive) {
         archiving_tab_closed(c);
     }
@@ -2948,6 +2973,7 @@ static WebKitWebView *webview_new(Client *c, WebKitWebView *webview,
         /* WebKitGTK 6.0: web-process-crashed signal replaced with web-process-terminated */
         "signal::web-process-terminated", G_CALLBACK(on_webview_web_process_terminated), c,
         "signal::authenticate", G_CALLBACK(on_webview_authenticate), c,
+        "signal::script-dialog", G_CALLBACK(on_webview_script_dialog), c,
         "signal::enter-fullscreen", G_CALLBACK(on_webview_enter_fullscreen), c,
         "signal::leave-fullscreen", G_CALLBACK(on_webview_leave_fullscreen), c,
         "signal::context-menu", G_CALLBACK(on_webview_context_menu), c,
@@ -3050,6 +3076,12 @@ static gboolean on_permission_request(WebKitWebView *webview,
     GtkWidget *dialog;
     int result;
     char *msg = NULL;
+
+    /* With nobody at the keyboard, there is nobody to ask. */
+    if (vb.scripted) {
+        webkit_permission_request_deny(request);
+        return TRUE;
+    }
 
     if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST(request)) {
         char* geolocation_setting = GET_CHAR(c, "geolocation");
@@ -3248,6 +3280,51 @@ static gboolean autocmdOptionArgFunc(const gchar *option_name,
     return TRUE;
 }
 
+
+static gboolean windowSizeOptionArgFunc(const gchar *option_name, const gchar *value,
+        gpointer data, GError **error)
+{
+    int width, height;
+    if (sscanf(value, "%dx%d", &width, &height) != 2 || width < 100 || height < 100) {
+        g_set_error(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
+                "--window-size takes WIDTHxHEIGHT, like 1280x900");
+        return FALSE;
+    }
+    vb.window_width  = width;
+    vb.window_height = height;
+    return TRUE;
+}
+
+static gboolean run_script(gpointer data)
+{
+    luascript_run_file(data, vb.script, TRUE);
+    return G_SOURCE_REMOVE;
+}
+
+/**
+ * Answers a page's alert, confirm or prompt when vimb is scripted, where a
+ * dialog would wait for ever: an alert is dismissed, a confirm declined, a
+ * prompt left unanswered, and leaving a page confirmed.
+ */
+static gboolean on_webview_script_dialog(WebKitWebView *webview, WebKitScriptDialog *dialog,
+        Client *c)
+{
+    if (!vb.scripted) {
+        return FALSE;
+    }
+    switch (webkit_script_dialog_get_dialog_type(dialog)) {
+        case WEBKIT_SCRIPT_DIALOG_CONFIRM:
+            webkit_script_dialog_confirm_set_confirmed(dialog, FALSE);
+            break;
+        case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM:
+            webkit_script_dialog_confirm_set_confirmed(dialog, TRUE);
+            break;
+        default:
+            break;
+    }
+    return TRUE;
+}
+
 int main(int argc, char* argv[])
 {
     Client *c;
@@ -3268,6 +3345,8 @@ int main(int argc, char* argv[])
         {"profile", 'p', 0, G_OPTION_ARG_CALLBACK, (GOptionArgFunc*)profileOptionArgFunc, "Profile name", NULL},
         {"version", 'v', 0, G_OPTION_ARG_NONE, &ver, "Print version", NULL},
         {"no-maximize", 0, 0, G_OPTION_ARG_NONE, &vb.no_maximize, "Do no attempt to maximize window", NULL},
+        {"script", 0, 0, G_OPTION_ARG_FILENAME, &vb.script, "Run a Lua script, then quit", "FILE"},
+        {"window-size", 0, 0, G_OPTION_ARG_CALLBACK, (GOptionArgFunc*)windowSizeOptionArgFunc, "Window size", "WIDTHxHEIGHT"},
         {"bug-info", 0, 0, G_OPTION_ARG_NONE, &buginfo, "Print used library versions", NULL},
         {NULL}
     };
@@ -3285,6 +3364,7 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
     g_option_context_free(opt_context);
+    vb.scripted = vb.script != NULL;
 
     /* initialize GTK+ */
     gtk_init();
@@ -3368,6 +3448,11 @@ int main(int argc, char* argv[])
         vb_load_uri(c, &(Arg){TARGET_CURRENT, argv[argc - 1]});
     }
 
+    /* the --script, once the main loop runs, so that it can wait */
+    if (vb.script) {
+        g_idle_add(run_script, c);
+    }
+
     /* GTK4: Use GMainLoop instead of gtk_main */
     main_loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(main_loop);
@@ -3377,5 +3462,5 @@ int main(int argc, char* argv[])
     vimb_cleanup();
 #endif
 
-    return EXIT_SUCCESS;
+    return vb.exit_status;
 }

@@ -55,6 +55,24 @@ gboolean archiving_tls_checked(Client *c);
 /* What the status bar shows for an archiving tab ("[REC name]"), or NULL. */
 const char *archiving_status(Client *c);
 
+/* For scripts (see luascript.h): an archive started without a tab, kept --
+ * held -- by its script so that it doesn't stop when the last of its tabs
+ * closes, and stopped with a callback once it is saved. verify and
+ * allow_internal are -1 to follow strict-ssl and archive-allow-internal. */
+struct Archive *archiving_create(Client *c, const char *name, int verify, int allow_internal,
+        GError **error);
+gboolean archiving_alive(struct Archive *archive);
+void archiving_hold(struct Archive *archive);
+void archiving_release(struct Archive *archive);
+typedef void (*ArchivingSaved)(const char *path, const char *error, gpointer data);
+void archiving_stop_async(struct Archive *archive, ArchivingSaved callback, gpointer data);
+gboolean archiving_set_paused(struct Archive *archive, gboolean pause);
+const char *archiving_name(struct Archive *archive);
+void archiving_rename(struct Archive *archive, const char *name);
+const char *archiving_state(struct Archive *archive);   /* "recording", ... */
+guint archiving_recorded(struct Archive *archive);
+const char *archiving_saved(struct Archive *archive);   /* the WACZ, once saved */
+
 /* Packages any capture a crash left behind, in the background. */
 void archiving_recover(Client *c);
 

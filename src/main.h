@@ -309,6 +309,11 @@ struct Vimb {
     GtkCssProvider *style_provider;
     gboolean    no_maximize;
     gboolean    incognito;
+    char        *script;            /* --script: a Lua script to run, then quit */
+    gboolean    scripted;           /* nobody at the keyboard: dialogs answer themselves */
+    int         exit_status;
+    int         window_width;       /* --window-size, or 0 */
+    int         window_height;
 
     WebKitWebContext *webcontext;
     WebKitNetworkSession *session;  /* WebKitGTK 6.0: network session for data/cookie management */
@@ -349,6 +354,7 @@ void vb_gui_style_update(Client *c, const char *name, const char *value);
 Client *vb_tab_new(Client *related, const char *uri, gboolean active);
 Client *vb_tab_new_archive(struct Archive *archive, const char *uri);
 void vb_session_setup(WebKitNetworkSession *session);
+void vb_exit(int status);
 void vb_tab_close(Client *c);
 void vb_tab_next(void);
 void vb_tab_prev(void);

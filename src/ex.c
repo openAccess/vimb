@@ -42,6 +42,7 @@
 #include "shortcut.h"
 #include "util.h"
 #include "archiving.h"
+#include "luascript.h"
 #include "ext-proxy.h"
 #include "autocmd.h"
 #include "util.h"
@@ -66,6 +67,8 @@ typedef enum {
     EX_NNOREMAP,
     EX_CUNMAP,
     EX_IUNMAP,
+    EX_LUA,
+    EX_LUAFILE,
     EX_INOREMAP,
     EX_NUNMAP,
     EX_NORMAL,
@@ -154,6 +157,7 @@ static void on_eval_script_finished_usermessage(GObject *source_object,
 static VbCmdResult ex_cleardata(Client *c, const ExArg *arg);
 static VbCmdResult ex_hardcopy(Client *c, const ExArg *arg);
 static void print_failed_cb(WebKitPrintOperation* op, GError *err, Client *c);
+static VbCmdResult ex_lua(Client *c, const ExArg *arg);
 static VbCmdResult ex_map(Client *c, const ExArg *arg);
 static VbCmdResult ex_unmap(Client *c, const ExArg *arg);
 static VbCmdResult ex_normal(Client *c, const ExArg *arg);
@@ -206,6 +210,8 @@ static ExInfo commands[] = {
     {"imap",             EX_IMAP,        ex_map,        EX_FLAG_LHS|EX_FLAG_CMD},
     {"inoremap",         EX_INOREMAP,    ex_map,        EX_FLAG_LHS|EX_FLAG_CMD},
     {"iunmap",           EX_IUNMAP,      ex_unmap,      EX_FLAG_LHS},
+    {"lua",              EX_LUA,         ex_lua,        EX_FLAG_CMD},
+    {"luafile",          EX_LUAFILE,     ex_lua,        EX_FLAG_RHS|EX_FLAG_EXP},
     {"nmap",             EX_NMAP,        ex_map,        EX_FLAG_LHS|EX_FLAG_CMD},
     {"nnoremap",         EX_NNOREMAP,    ex_map,        EX_FLAG_LHS|EX_FLAG_CMD},
     {"normal",           EX_NORMAL,      ex_normal,     EX_FLAG_BANG|EX_FLAG_CMD},
@@ -863,6 +869,22 @@ static VbCmdResult ex_autocmd(Client *c, const ExArg *arg)
     return autocmd_add(c, arg->rhs->str, arg->bang) ? CMD_SUCCESS : CMD_ERROR;
 }
 #endif
+
+/**
+ * :lua CODE and :luafile FILE -- run Lua (see luascript.h).
+ */
+static VbCmdResult ex_lua(Client *c, const ExArg *arg)
+{
+    if (!arg->rhs->len) {
+        return CMD_ERROR;
+    }
+    if (arg->code == EX_LUAFILE) {
+        luascript_run_file(c, arg->rhs->str, FALSE);
+    } else {
+        luascript_run_string(c, arg->rhs->str);
+    }
+    return CMD_SUCCESS;
+}
 
 /**
  * :archive -- archiving what is browsed in a tab as a WACZ (see archiving.h).

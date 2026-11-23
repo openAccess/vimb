@@ -65,7 +65,14 @@ struct Archive {
     guint                done_source;   /* package_done(), queued by the packager */
     char                 *saved;        /* where it was packaged */
     GError               *error;        /* why it wasn't */
+    guint                holds;         /* scripts keeping it, tabs or not */
+    GSList               *waiters;      /* of SavedWaiter, told once it's saved */
 };
+
+typedef struct {
+    ArchivingSaved callback;
+    gpointer       data;
+} SavedWaiter;
 
 /* Where each archiving tab is in listing its pages. */
 typedef struct {
@@ -401,7 +408,18 @@ static gboolean package_done(gpointer data)
                 a->name, a->error ? a->error->message : "unknown error", a->dir);
     }
     update_status(a);
-    if (!a->tabs) {
+
+    GSList *waiters = a->waiters;
+    a->waiters      = NULL;
+    for (GSList *l = waiters; l; l = l->next) {
+        SavedWaiter *w = l->data;
+        w->callback(a->saved, a->saved ? NULL : (a->error ? a->error->message : "unknown error"),
+                w->data);
+        g_free(w);
+    }
+    g_slist_free(waiters);
+
+    if (!a->tabs && !a->holds) {
         archive_free(a);
     }
     return G_SOURCE_REMOVE;
@@ -487,7 +505,10 @@ static void apply_cookie_policy(WebKitNetworkSession *session, const char *polic
     }
 }
 
-static struct Archive *archive_start(Client *c, const char *name, GError **error)
+/* verify and allow_internal are -1 to follow the settings strict-ssl and
+ * archive-allow-internal. */
+static struct Archive *archive_start(Client *c, const char *name, int verify,
+        int allow_internal, GError **error)
 {
     struct Archive *a = g_new0(struct Archive, 1);
     a->lock_fd = -1;
@@ -525,14 +546,15 @@ static struct Archive *archive_start(Client *c, const char *name, GError **error
     char *data_dir = util_get_data_dir();
     char *ca_dir   = g_build_filename(data_dir, "archive-ca", NULL);
     char *warc     = g_build_filename(a->dir, a->warc_name, NULL);
-    a->verifies    = GET_BOOL(c, "strict-ssl");
+    a->verifies    = verify >= 0 ? verify : GET_BOOL(c, "strict-ssl");
     ArchiveProxyOptions options = {
         .ca_dir            = ca_dir,
         .warc_path         = warc,
         .tmp_dir           = a->dir,
         .software          = "vimb " VERSION,
         .verify_upstream   = a->verifies,
-        .allow_internal    = GET_BOOL(c, "archive-allow-internal"),
+        .allow_internal    = allow_internal >= 0 ? allow_internal
+                                 : GET_BOOL(c, "archive-allow-internal"),
         .check_peer_user   = TRUE,
         .allow_certificate = on_allow_certificate,
         .allow_data        = a,
@@ -614,7 +636,8 @@ void archiving_tab_closed(Client *c)
         g_free(ps);
     }
     c->archive = NULL;
-    if (!a || --a->tabs) {
+    /* A script keeping the archive may open its next tab after this one. */
+    if (!a || --a->tabs || a->holds) {
         return;
     }
     /* The last tab gone: what was recording is packaged, and what is done
@@ -650,7 +673,7 @@ static struct Archive *target(Client *c)
 static VbCmdResult start(Client *c, const char *name)
 {
     GError *error     = NULL;
-    struct Archive *a = archive_start(c, name, &error);
+    struct Archive *a = archive_start(c, name, -1, -1, &error);
     if (!a) {
         vb_echo(c, MSG_ERROR, TRUE, "Could not start archiving: %s", error->message);
         g_error_free(error);
@@ -691,29 +714,14 @@ VbCmdResult archiving_command(Client *c, const char *args)
             vb_echo(c, MSG_ERROR, TRUE, "'%s' is no longer recording", a->name);
             result = CMD_ERROR;
         } else if (!strcmp(word, "pause") || !strcmp(word, "resume")) {
-            gboolean pause = !strcmp(word, "pause");
-            if (pause && a->state == ARCHIVE_RECORDING) {
-                /* The page awaiting its title is listed: it was archived. */
-                close_page_list(a);
-                char *pages_file = g_build_filename(a->dir, ARCHIVE_PAGES_FILE, NULL);
-                a->pages = g_fopen(pages_file, "a");
-                g_free(pages_file);
-            }
-            archive_proxy_set_paused(a->proxy, pause);
-            a->state = pause ? ARCHIVE_PAUSED : ARCHIVE_RECORDING;
-            update_status(a);
+            archiving_set_paused(a, !strcmp(word, "pause"));
         } else if (!strcmp(word, "stop")) {
             archive_stop(a);
             vb_echo(c, MSG_NORMAL, FALSE, "Saving '%s'...", a->name);
         } else if (!*rest) {
             vb_echo(c, MSG_NORMAL, FALSE, "Archive name: %s", a->name);
         } else {
-            g_free(a->name);
-            a->name = g_strdup(rest);
-            char *name_file = g_build_filename(a->dir, NAME_FILE, NULL);
-            g_file_set_contents(name_file, a->name, -1, NULL);
-            g_free(name_file);
-            update_status(a);
+            archiving_rename(a, rest);
         }
     } else {
         /* :archive NAME */
@@ -722,6 +730,101 @@ VbCmdResult archiving_command(Client *c, const char *args)
     g_free(word);
     g_free(text);
     return result;
+}
+
+/* ---- for scripts ------------------------------------------------------- */
+
+struct Archive *archiving_create(Client *c, const char *name, int verify, int allow_internal,
+        GError **error)
+{
+    return archive_start(c, name, verify, allow_internal, error);
+}
+
+gboolean archiving_alive(struct Archive *a)
+{
+    return a && g_list_find(archives, a) != NULL;
+}
+
+void archiving_hold(struct Archive *a)
+{
+    a->holds++;
+}
+
+void archiving_release(struct Archive *a)
+{
+    if (!archiving_alive(a) || !a->holds || --a->holds || a->tabs) {
+        return;
+    }
+    if (a->state == ARCHIVE_RECORDING || a->state == ARCHIVE_PAUSED) {
+        archive_stop(a);
+    } else if (a->state == ARCHIVE_DONE) {
+        archive_free(a);
+    }
+}
+
+void archiving_stop_async(struct Archive *a, ArchivingSaved callback, gpointer data)
+{
+    if (a->state == ARCHIVE_DONE) {
+        callback(a->saved, a->saved ? NULL : (a->error ? a->error->message : "unknown error"),
+                data);
+        return;
+    }
+    SavedWaiter *w = g_new0(SavedWaiter, 1);
+    w->callback    = callback;
+    w->data        = data;
+    a->waiters     = g_slist_append(a->waiters, w);
+    archive_stop(a);
+}
+
+gboolean archiving_set_paused(struct Archive *a, gboolean pause)
+{
+    if (a->state != ARCHIVE_RECORDING && a->state != ARCHIVE_PAUSED) {
+        return FALSE;
+    }
+    if (pause && a->state == ARCHIVE_RECORDING) {
+        /* The page awaiting its title is listed: it was archived. */
+        close_page_list(a);
+        char *pages_file = g_build_filename(a->dir, ARCHIVE_PAGES_FILE, NULL);
+        a->pages = g_fopen(pages_file, "a");
+        g_free(pages_file);
+    }
+    archive_proxy_set_paused(a->proxy, pause);
+    a->state = pause ? ARCHIVE_PAUSED : ARCHIVE_RECORDING;
+    update_status(a);
+    return TRUE;
+}
+
+const char *archiving_name(struct Archive *a)
+{
+    return a->name;
+}
+
+void archiving_rename(struct Archive *a, const char *name)
+{
+    g_free(a->name);
+    a->name = g_strdup(name);
+    if (a->state == ARCHIVE_RECORDING || a->state == ARCHIVE_PAUSED) {
+        char *name_file = g_build_filename(a->dir, NAME_FILE, NULL);
+        g_file_set_contents(name_file, a->name, -1, NULL);
+        g_free(name_file);
+    }
+    update_status(a);
+}
+
+const char *archiving_state(struct Archive *a)
+{
+    static const char *states[] = {"recording", "paused", "saving", "done"};
+    return states[a->state];
+}
+
+guint archiving_recorded(struct Archive *a)
+{
+    return a->proxy ? archive_proxy_get_recorded(a->proxy) : 0;
+}
+
+const char *archiving_saved(struct Archive *a)
+{
+    return a->saved;
 }
 
 /* ---- leftovers, and the end -------------------------------------------- */
