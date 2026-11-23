@@ -38,12 +38,19 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   limit, no io, os.execute, require or load, no `t:eval` or `vimb.quit`, the
   assistant's rule for URLs, and an instruction budget. `--assistant-scripts`
   lets them run unasked in a headless task.
+* Unattended runs: `--assistant-task-file FILE`, `--summary FILE` (what
+  the run came to, as JSON), and `--timeout SECONDS` (stop, save, exit 2).
+  `contrib/container` builds an image that runs vimb under Xvfb for an
+  assistant's task, a crawl, a Lua script or MCP over stdio, writing WACZs
+  to `/out`.
 * `--mcp-http PORT` serves MCP over HTTP (the streamable HTTP transport) at
   127.0.0.1:PORT/mcp to the user's own programs, with sessions, and calls
   that stream with keepalives. Linux only.
 
 ## Changed
 * Use webkit's built-in user-agent as default for setting `user-agent`
+* `--cmd` commands run in every new tab, after the configuration file, as
+  they ran in every new window; before, only the first tab got them.
 
 ### Fixed
 * Fixed use-after-free / crash when closing the focused tab with `:tabclose`.

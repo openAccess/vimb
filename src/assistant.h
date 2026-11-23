@@ -20,6 +20,8 @@
 #ifndef _ASSISTANT_H
 #define _ASSISTANT_H
 
+#include <json-glib/json-glib.h>
+
 #include "main.h"
 
 /* The assistant: a model (backend.h) that browses and archives with the
@@ -36,6 +38,11 @@ VbCmdResult assistant_command(Client *c, const char *args);     /* :assistant */
  * NULL if it ended as it should. */
 typedef void (*AssistantDone)(const char *error, gpointer data);
 void assistant_on_done(AssistantDone done, gpointer data);
+
+/* What the assistant did, for a summary: {backend, rounds, tool_calls,
+ * reply} -- the reply its last turn's words. */
+JsonObject *assistant_report(void);
+gboolean assistant_busy(void);
 
 void assistant_shutdown(void);
 

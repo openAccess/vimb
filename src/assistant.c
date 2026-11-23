@@ -64,6 +64,8 @@ typedef struct {
     gpointer      done_data;
     ToolApproved  approve;      /* a script waiting for the person's say */
     gpointer      approve_data;
+    GString       *reply;       /* what it said in the last turn */
+    guint         tool_calls;   /* in all */
     /* the pane */
     GtkWidget     *pane;
     GtkTextView   *view;
@@ -371,6 +373,9 @@ static void turn_over(const char *error)
 
 static void on_text(const char *delta, gpointer data)
 {
+    if (A.reply) {
+        g_string_append(A.reply, delta);
+    }
     pane_write("reply", delta);
 }
 
@@ -469,6 +474,7 @@ static void run_next_call(void)
         return;
     }
     BackendToolCall *call = g_ptr_array_index(A.calls, A.next_call);
+    A.tool_calls++;
     char *args = brief(call->input);
     pane_line("tool", "\u2192 %s%s", call->name, args);
     g_free(args);
@@ -636,6 +642,11 @@ VbCmdResult assistant_ask(Client *c, const char *text)
     A.busy   = TRUE;
     A.rounds = 0;
     A.generation++;
+    if (A.reply) {
+        g_string_truncate(A.reply, 0);
+    } else {
+        A.reply = g_string_new(NULL);
+    }
     A.backend->send(A.backend, message);
     g_free(message);
     return CMD_SUCCESS;
@@ -674,6 +685,21 @@ VbCmdResult assistant_command(Client *c, const char *args)
     return CMD_SUCCESS;
 }
 
+JsonObject *assistant_report(void)
+{
+    JsonObject *o = json_object_new();
+    json_object_set_string_member(o, "backend", A.backend ? A.backend->name : NULL);
+    json_object_set_int_member(o, "rounds", A.rounds);
+    json_object_set_int_member(o, "tool_calls", A.tool_calls);
+    json_object_set_string_member(o, "reply", A.reply ? A.reply->str : NULL);
+    return o;
+}
+
+gboolean assistant_busy(void)
+{
+    return A.busy;
+}
+
 void assistant_on_done(AssistantDone done, gpointer data)
 {
     A.done      = done;
@@ -683,6 +709,10 @@ void assistant_on_done(AssistantDone done, gpointer data)
 void assistant_shutdown(void)
 {
     clear();
+    if (A.reply) {
+        g_string_free(A.reply, TRUE);
+        A.reply = NULL;
+    }
     g_clear_pointer(&A.known, g_hash_table_unref);
     g_clear_pointer(&A.hosts, g_ptr_array_unref);
 }

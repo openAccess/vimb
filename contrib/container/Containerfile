@@ -1,0 +1,39 @@
+# vimb in a container: archiving with nobody at the keyboard -- an
+# assistant's task, a crawl, a Lua script, or MCP over stdio. See README.md.
+#
+#   podman build -t vimb-archive -f contrib/container/Containerfile .
+#
+# (from the top of the vimb tree; docker build works the same way)
+
+FROM registry.fedoraproject.org/fedora:43 AS build
+RUN dnf -y install --setopt=install_weak_deps=False gcc make git-core \
+        'pkgconfig(gtk4)' 'pkgconfig(gio-unix-2.0)' 'pkgconfig(webkitgtk-6.0)' \
+        'pkgconfig(gnutls)' 'pkgconfig(json-glib-1.0)' 'pkgconfig(zlib)' \
+        'pkgconfig(libsoup-3.0)' 'pkgconfig(lua)' \
+    && dnf clean all
+COPY . /src
+WORKDIR /src
+# version.h first: a parallel make from a clean tree races for it
+RUN make version.h && make -j"$(nproc)" && make DESTDIR=/stage install
+
+FROM registry.fedoraproject.org/fedora:43
+RUN dnf -y install --setopt=install_weak_deps=False \
+        webkitgtk6.0 glib-networking gnutls json-glib lua-libs zlib-ng-compat \
+        xorg-x11-server-Xvfb mesa-dri-drivers mesa-libEGL \
+        gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugin-libav \
+        dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts liberation-fonts \
+        google-noto-sans-fonts google-noto-serif-fonts google-noto-color-emoji-fonts \
+        ca-certificates \
+    && dnf clean all
+COPY --from=build /stage/usr/local /usr/local
+COPY contrib/container/vimb-archive /usr/local/bin/vimb-archive
+COPY contrib/container/crawl.lua /usr/local/share/vimb/crawl.lua
+
+# whoever the container runs as can keep vimb's profile and write /out
+RUN mkdir -p /home/vimb /out && chmod 1777 /home/vimb /out
+ENV HOME=/home/vimb \
+    NO_AT_BRIDGE=1 \
+    GTK_A11Y=none
+VOLUME /out
+ENTRYPOINT ["/usr/local/bin/vimb-archive"]
+CMD ["help"]

@@ -1,0 +1,109 @@
+#!/bin/bash
+# vimb-archive: vimb in a container, archiving with nobody at the keyboard.
+# The container's entrypoint; see README.md.
+
+set -u
+
+usage() {
+    cat >&2 <<'EOF'
+vimb-archive MODE [ARGUMENTS]
+
+  task TEXT...      the assistant does TEXT (ASSISTANT, and its key, below)
+  task-file FILE    the assistant does what FILE says
+  crawl URL...      archive the URLs and the links on them (CRAWL_* below)
+  script FILE       run a Lua script (see Scripting in vimb(1))
+  mcp [OPTIONS]     serve MCP on stdin and stdout (run the container with -i)
+  vimb [OPTIONS]    run vimb with these options, as they are
+
+Archives go to /out (or $OUT), with summary.json saying what the run came
+to; the exit status is 0 if all went well, 1 if not, 2 if TIMEOUT ran out.
+
+Environment:
+  ANTHROPIC_API_KEY, GEMINI_API_KEY   the assistant's key
+  ASSISTANT          claude (the default) or gemini
+  ASSISTANT_MODEL, ASSISTANT_EFFORT   see assistant-model, assistant-effort
+  SCRIPTS=1          let the assistant run the Lua scripts it writes
+  TIMEOUT=SECONDS    stop then, saving what was archived
+  STRICT_SSL=0       archive sites whatever their certificates
+  ALLOW_INTERNAL=1   let archives reach private and loopback addresses
+  CRAWL_DEPTH (1), CRAWL_SCOPE (page-links: the URLs and the links on them;
+  or site, host, pattern, any), CRAWL_PATTERN, CRAWL_MAX_PAGES (100),
+  CRAWL_MAX_SECONDS, CRAWL_DELAY (1), CRAWL_SCROLL (1), CRAWL_NAME
+  WINDOW_SIZE (1280x900)
+EOF
+}
+
+mode=${1:-help}
+[ $# -gt 0 ] && shift
+case "$mode" in
+    help|-h|--help) usage; exit 0 ;;
+esac
+
+out=${OUT:-/out}
+mkdir -p "$out" "$HOME"
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}
+mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+
+# a display: vimb has no headless mode, and WebKit slows a hidden page down.
+# Xvfb picks a free one and says which when it is ready -- a fixed number
+# could be taken, with --network host, by a display of the host's (X's
+# abstract sockets go with the network namespace). Nothing of Xvfb's goes
+# to stdout, which is MCP's in mcp mode.
+displayfile="$XDG_RUNTIME_DIR/display.$$"
+: > "$displayfile"
+Xvfb -displayfd 3 -screen 0 "${SCREEN:-1600x1000x24}" -nolisten tcp \
+    3>"$displayfile" >/dev/null 2>&1 &
+for _ in $(seq 100); do
+    [ -s "$displayfile" ] && break
+    sleep 0.1
+done
+display=$(tr -dc 0-9 < "$displayfile")
+rm -f "$displayfile"
+if [ -z "$display" ]; then
+    echo "vimb-archive: Xvfb didn't start" >&2
+    exit 1
+fi
+export DISPLAY=":$display" GDK_BACKEND=x11
+
+args=(--window-size "${WINDOW_SIZE:-1280x900}" -C "set archive-dir=$out")
+[ "${STRICT_SSL:-1}" = 0 ] && args+=(-C "set strict-ssl=false")
+[ "${ALLOW_INTERNAL:-0}" = 1 ] && args+=(-C "set archive-allow-internal=true")
+[ -n "${ASSISTANT:-}" ] && args+=(-C "set assistant=$ASSISTANT")
+[ -n "${ASSISTANT_MODEL:-}" ] && args+=(-C "set assistant-model=$ASSISTANT_MODEL")
+[ -n "${ASSISTANT_EFFORT:-}" ] && args+=(-C "set assistant-effort=$ASSISTANT_EFFORT")
+[ -n "${TIMEOUT:-}" ] && args+=(--timeout "$TIMEOUT")
+summary=(--summary "$out/summary.json")
+
+case "$mode" in
+    task)
+        [ $# -gt 0 ] || { usage; exit 64; }
+        args+=("${summary[@]}" --assistant-task "$*")
+        [ "${SCRIPTS:-0}" = 1 ] && args+=(--assistant-scripts)
+        ;;
+    task-file)
+        [ $# -eq 1 ] || { usage; exit 64; }
+        args+=("${summary[@]}" --assistant-task-file "$1")
+        [ "${SCRIPTS:-0}" = 1 ] && args+=(--assistant-scripts)
+        ;;
+    crawl)
+        [ $# -gt 0 ] || { usage; exit 64; }
+        export CRAWL_SEEDS="$*"
+        args+=("${summary[@]}" --script /usr/local/share/vimb/crawl.lua)
+        ;;
+    script)
+        [ $# -eq 1 ] || { usage; exit 64; }
+        args+=("${summary[@]}" --script "$1")
+        ;;
+    mcp)
+        args+=(--mcp "$@")
+        ;;
+    vimb)
+        args=("$@")
+        ;;
+    *)
+        echo "vimb-archive: no mode $mode" >&2
+        usage
+        exit 64
+        ;;
+esac
+exec vimb "${args[@]}"

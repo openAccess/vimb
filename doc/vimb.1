@@ -26,7 +26,8 @@ If \fIURI\fP is '-', Vimb reads the HTML to display from stdin.
 Mandatory arguments to long options are mandatory for short options too.
 .TP
 .BI "\-C, \-\-cmd " "CMD"
-Run \fICMD\fP as ex command line right before the first page is loaded.
+Run \fICMD\fP as ex command line right before the first page is loaded \(em
+in each new tab, after the configuration file.
 If the flag is used more than one time, the commands are called in order they
 are given.
 You could also pass several ex commands in one \fICMD\fP,
@@ -83,6 +84,9 @@ What it says, and the tools it uses, are printed on stderr.
 Archives it left recording are saved first.
 Nobody is taken to be at the keyboard, as with \fB\-\-script\fP.
 .TP
+.BI "\-\-assistant-task-file " FILE
+As \fB\-\-assistant-task\fP, with the task in \fIFILE\fP.
+.TP
 .B "\-\-assistant-scripts"
 With \fB\-\-assistant-task\fP, let the assistant run the scripts it writes
 without asking, as nobody is there to say yes; without it, it is offered no
@@ -104,6 +108,15 @@ Offer MCP clients the run_javascript tool.
 .BI "\-\-mcp-allow-domains " DOMAIN,...
 Let MCP clients open only URLs on these sites (each domain and those below
 it).
+.TP
+.BI "\-\-summary " FILE
+When vimb quits, write what the run came to in \fIFILE\fP, as JSON: the
+mode, the exit status, the first error, the archives saved and, for a task,
+what the assistant said.
+.TP
+.BI "\-\-timeout " SECONDS
+Stop after \fISECONDS\fP: what the assistant is doing stops, what was archived
+is saved, and vimb quits with status 2.
 .TP
 .BI "\-\-window-size " WIDTHxHEIGHT
 Open the window this size, and don't maximize it.

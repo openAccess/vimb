@@ -315,6 +315,10 @@ struct Vimb {
     GtkWidget   *paned;             /* the tabs, and beside them the assistant */
     char        *assistant_task;    /* --assistant-task: given the assistant, then quit */
     gboolean    assistant_scripts;  /* --assistant-scripts: its scripts run unasked */
+    char        *summary;           /* --summary: where to write what the run came to */
+    int         timeout;            /* --timeout: seconds the run may take; 0 for any */
+    gboolean    timed_out;
+    char        *error;             /* the first thing that went wrong, for the summary */
     gboolean    mcp;                /* --mcp: serve MCP on stdin and stdout */
     int         mcp_out;            /* stdout, kept for MCP; fd 1 is stderr then */
     int         mcp_http;           /* --mcp-http: serve MCP over HTTP on this port */
@@ -363,6 +367,8 @@ Client *vb_tab_new(Client *related, const char *uri, gboolean active);
 Client *vb_tab_new_archive(struct Archive *archive, const char *uri);
 void vb_session_setup(WebKitNetworkSession *session);
 void vb_exit(int status);
+/* Notes what went wrong, for --summary: the first message noted is kept. */
+void vb_set_error(const char *message);
 void vb_tab_close(Client *c);
 void vb_tab_next(void);
 void vb_tab_prev(void);

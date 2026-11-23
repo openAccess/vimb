@@ -174,6 +174,13 @@ static gboolean signal_handler_cb(gpointer user_data)
 /**
  * Quit vimb with the given exit status -- for a script that has finished.
  */
+void vb_set_error(const char *message)
+{
+    if (!vb.error && message) {
+        vb.error = g_strdup(message);
+    }
+}
+
 void vb_exit(int status)
 {
     vb.exit_status = status;
@@ -2661,6 +2668,12 @@ static Client *tab_new(Client *related, struct Archive *archive, const char *uri
     /* Read config file */
     ex_run_file(c, vb.files[FILES_CONFIG]);
 
+    /* Then the --cmd commands: each tab gets them, as each window did when
+     * windows were vimb's tabs (see spawn_new_instance) */
+    for (GSList *l = vb.cmdargs; l; l = l->next) {
+        ex_run_string(c, l->data, false);
+    }
+
     /* Switch to the new tab and focus its webview */
     if (active) {
         gtk_notebook_set_current_page(GTK_NOTEBOOK(vb.notebook), page_num);
@@ -3307,6 +3320,7 @@ static void assistant_task_done(const char *error, gpointer data)
 {
     if (error) {
         fprintf(stderr, "vimb: the assistant's task failed: %s\n", error);
+        vb_set_error(error);
     }
     tools_release();                /* what it archived is saved as vimb quits */
     vb_exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -3320,6 +3334,66 @@ static gboolean run_assistant_task(gpointer data)
         vb_exit(EXIT_FAILURE);
     }
     return G_SOURCE_REMOVE;
+}
+
+/* --timeout: the run is over, and what was archived is saved. */
+static gboolean time_is_up(gpointer data)
+{
+    char *message = g_strdup_printf("the run took more than %d seconds", vb.timeout);
+    fprintf(stderr, "vimb: %s; saving and quitting\n", message);
+    vb_set_error(message);
+    g_free(message);
+    vb.timed_out = TRUE;
+    if (assistant_busy()) {
+        assistant_command(vb_get_current_client(), "stop");
+    }
+    tools_release();
+    vb_exit(2);                     /* last, so that it is the status */
+    return G_SOURCE_REMOVE;
+}
+
+/* --summary: what the run came to, as JSON -- written once everything has
+ * been saved. Takes assistant. */
+static void write_summary(JsonObject *assistant, double seconds)
+{
+    JsonObject *o = json_object_new();
+    json_object_set_string_member(o, "vimb", VERSION);
+    json_object_set_string_member(o, "mode", vb.assistant_task ? "task" : vb.script ? "script"
+            : vb.mcp ? "mcp" : "browse");
+    if (vb.assistant_task) {
+        json_object_set_string_member(o, "task", vb.assistant_task);
+    }
+    if (vb.script) {
+        json_object_set_string_member(o, "script", vb.script);
+    }
+    json_object_set_int_member(o, "status", vb.exit_status);
+    json_object_set_boolean_member(o, "ok", vb.exit_status == 0);
+    json_object_set_string_member(o, "error", vb.error);
+    json_object_set_boolean_member(o, "timed_out", vb.timed_out);
+    json_object_set_double_member(o, "seconds", seconds);
+    JsonArray *archives = json_array_new();
+    GPtrArray *saved = archiving_saved_all();
+    for (guint i = 0; i < saved->len; i++) {
+        json_array_add_string_element(archives, g_ptr_array_index(saved, i));
+    }
+    json_object_set_array_member(o, "archives", archives);
+    if (vb.assistant_task) {
+        json_object_set_object_member(o, "assistant", assistant);
+    } else {
+        json_object_unref(assistant);
+    }
+    JsonNode *node = json_node_new(JSON_NODE_OBJECT);
+    json_node_take_object(node, o);
+    char *text = json_to_string(node, TRUE);
+    char *with_newline = g_strconcat(text, "\n", NULL);
+    GError *error = NULL;
+    if (!g_file_set_contents(vb.summary, with_newline, -1, &error)) {
+        fprintf(stderr, "vimb: can't write the summary: %s\n", error->message);
+        g_error_free(error);
+    }
+    g_free(with_newline);
+    g_free(text);
+    json_node_unref(node);
 }
 
 static gboolean start_mcp(void)
@@ -3389,6 +3463,7 @@ int main(int argc, char* argv[])
     char *winid = NULL;
 #endif
     gboolean ver = FALSE, buginfo = FALSE;
+    char *task_file = NULL;
 
     GOptionEntry opts[] = {
         {"cmd", 'C', 0, G_OPTION_ARG_CALLBACK, (GOptionArgFunc*)autocmdOptionArgFunc, "Ex command run before first page is loaded", NULL},
@@ -3403,6 +3478,9 @@ int main(int argc, char* argv[])
         {"script", 0, 0, G_OPTION_ARG_FILENAME, &vb.script, "Run a Lua script, then quit", "FILE"},
         {"window-size", 0, 0, G_OPTION_ARG_CALLBACK, (GOptionArgFunc*)windowSizeOptionArgFunc, "Window size", "WIDTHxHEIGHT"},
         {"assistant-task", 0, 0, G_OPTION_ARG_STRING, &vb.assistant_task, "Give the assistant a task, then quit when it is done", "TEXT"},
+        {"assistant-task-file", 0, 0, G_OPTION_ARG_FILENAME, &task_file, "Give the assistant the task in FILE, then quit when it is done", "FILE"},
+        {"summary", 0, 0, G_OPTION_ARG_FILENAME, &vb.summary, "Write what the run came to, as JSON, to FILE", "FILE"},
+        {"timeout", 0, 0, G_OPTION_ARG_INT, &vb.timeout, "Stop after SECONDS, saving what was archived; exit status 2", "SECONDS"},
         {"assistant-scripts", 0, 0, G_OPTION_ARG_NONE, &vb.assistant_scripts, "Let the assistant's scripts run without asking, when nobody is at the keyboard", NULL},
         {"mcp", 0, 0, G_OPTION_ARG_NONE, &vb.mcp, "Serve the Model Context Protocol on stdin and stdout", NULL},
         {"mcp-http", 0, 0, G_OPTION_ARG_INT, &vb.mcp_http, "Serve the Model Context Protocol over HTTP on 127.0.0.1:PORT", "PORT"},
@@ -3425,6 +3503,16 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
     g_option_context_free(opt_context);
+    if (task_file) {
+        char *task = NULL;
+        if (!g_file_get_contents(task_file, &task, NULL, &err)) {
+            fprintf(stderr, "vimb: --assistant-task-file: %s\n", err->message);
+            g_error_free(err);
+            return EXIT_FAILURE;
+        }
+        g_free(vb.assistant_task);
+        vb.assistant_task = g_strstrip(task);
+    }
     vb.scripted = vb.script != NULL || vb.mcp || vb.assistant_task != NULL;
     if (vb.mcp) {
         if (vb.script || (argc > 1 && !strcmp(argv[argc - 1], "-"))) {
@@ -3510,10 +3598,6 @@ int main(int argc, char* argv[])
     /* package any capture a crash left behind */
     archiving_recover(c);
 
-    /* process the --cmd if this was given */
-    for (GSList *l = vb.cmdargs; l; l = l->next) {
-        ex_run_string(c, l->data, false);
-    }
     if (argc <= 1) {
         vb_load_uri(c, &(Arg){TARGET_CURRENT, NULL});
     } else if (!strcmp(argv[argc - 1], "-")) {
@@ -3534,12 +3618,23 @@ int main(int argc, char* argv[])
         g_idle_add(run_assistant_task, c);
     }
 
+    if (vb.timeout > 0) {
+        g_timeout_add_seconds((guint)vb.timeout, time_is_up, NULL);
+    }
+    gint64 started = g_get_monotonic_time();
+
     /* GTK4: Use GMainLoop instead of gtk_main */
     main_loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(main_loop);
     g_main_loop_unref(main_loop);
+    JsonObject *assistant = assistant_report();
     assistant_shutdown();
     archiving_shutdown();
+    if (vb.summary) {
+        write_summary(assistant, (g_get_monotonic_time() - started) / 1e6);
+    } else {
+        json_object_unref(assistant);
+    }
 #ifdef FREE_ON_QUIT
     vimb_cleanup();
 #endif

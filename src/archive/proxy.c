@@ -1184,6 +1184,13 @@ static void proxy_free(ArchiveProxy *proxy)
 
 ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **error)
 {
+    /* Without a TLS backend (glib-networking), every https page would fail
+     * as it loaded, saying only that its load was interrupted. */
+    if (!g_tls_backend_supports_tls(g_tls_backend_get_default())) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                "GIO has no TLS backend, so https can't be archived (install glib-networking)");
+        return NULL;
+    }
     ArchiveProxy *proxy      = g_new0(ArchiveProxy, 1);
     proxy->tmp_dir           = g_strdup(options->tmp_dir ? options->tmp_dir : g_get_tmp_dir());
     proxy->verify_upstream   = options->verify_upstream;

@@ -76,6 +76,9 @@ const char *archiving_saved(struct Archive *archive);   /* the WACZ, once saved 
 /* Packages any capture a crash left behind, in the background. */
 void archiving_recover(Client *c);
 
+/* The WACZs saved in this run, oldest first: char *s, vimb's. */
+GPtrArray *archiving_saved_all(void);
+
 /* Finishes every archive: what is still recording is packaged, at once. */
 void archiving_shutdown(void);
 

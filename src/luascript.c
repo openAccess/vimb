@@ -141,6 +141,9 @@ static void script_end(Script *s, int status, int nresults)
         luaL_traceback(L, s->co, message ? message : "error", 0);
         char *text = g_strdup_printf("vimb: %s: %s", s->name, lua_tostring(L, -1));
         report(NULL, TRUE, text);
+        if (s->exit_when_done) {
+            vb_set_error(text + strlen("vimb: "));
+        }
         g_free(text);
         lua_pop(L, 1);
     }

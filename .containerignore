@@ -1,0 +1,16 @@
+# What a container build (contrib/container/Containerfile) leaves out: what
+# a build makes, which the container's build makes again.
+sandbox
+version.h
+**/*.o
+**/*.a
+**/*.so
+**/*.d
+**/*.lo
+src/vimb
+src/archive/vimb-archive-proxy
+src/archive/vimb-archive-pack
+tests/archive/test-archive
+tests/archive/webkit-check
+tests/*.o
+**/__pycache__

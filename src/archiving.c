@@ -89,6 +89,15 @@ typedef struct {
 
 static GList *archives;
 static GHashTable *page_states;     /* Client * -> PageState * */
+static GPtrArray *saved_paths;      /* every WACZ saved in this run */
+
+static void note_saved(const char *path)
+{
+    if (!saved_paths) {
+        saved_paths = g_ptr_array_new_with_free_func(g_free);
+    }
+    g_ptr_array_add(saved_paths, g_strdup(path));
+}
 static GThread *recovery;
 
 static char *now_iso8601(void)
@@ -400,6 +409,7 @@ static gboolean package_done(gpointer data)
     a->state       = ARCHIVE_DONE;
     if (a->saved) {
         remove_capture_dir(a->dir);
+        note_saved(a->saved);
         if (c) {
             vb_echo(c, MSG_NORMAL, FALSE, "Archive saved: %s", a->saved);
         }
@@ -910,6 +920,14 @@ void archiving_recover(Client *c)
     recovery        = g_thread_new("archive-recover", recovery_run, r);
 }
 
+GPtrArray *archiving_saved_all(void)
+{
+    if (!saved_paths) {
+        saved_paths = g_ptr_array_new_with_free_func(g_free);
+    }
+    return saved_paths;
+}
+
 void archiving_shutdown(void)
 {
     if (recovery) {
@@ -934,6 +952,7 @@ void archiving_shutdown(void)
             }
             if (a->saved) {
                 remove_capture_dir(a->dir);
+                note_saved(a->saved);
                 fprintf(stderr, "vimb: archive saved: %s\n", a->saved);
             } else {
                 fprintf(stderr, "vimb: archive '%s' could not be packaged: %s (its files are in %s)\n",
