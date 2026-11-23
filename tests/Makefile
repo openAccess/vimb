@@ -16,7 +16,7 @@ TEST_PROGS = test-util \
 # network) loads pages through the proxy in a WebKit view.
 ARCHIVE_DIR   = ../$(SRCDIR)/archive
 ARCHIVE_LIB   = $(ARCHIVE_DIR)/libvimbarchive.a
-ARCHIVE_PKGS  = glib-2.0 gio-2.0 gnutls zlib
+ARCHIVE_PKGS  = glib-2.0 gio-2.0 gnutls json-glib-1.0 zlib
 ARCHIVE_TESTS = archive/test-archive
 
 all: $(TEST_PROGS) $(ARCHIVE_TESTS)

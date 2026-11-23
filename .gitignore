@@ -7,3 +7,4 @@ version.h
 src/archive/vimb-archive-proxy
 tests/archive/test-archive
 tests/archive/webkit-check
+src/archive/vimb-archive-pack

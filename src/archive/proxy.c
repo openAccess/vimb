@@ -1131,6 +1131,11 @@ static gpointer accept_run(gpointer data)
     g_socket_service_stop(service);
     g_socket_listener_close(G_SOCKET_LISTENER(service));
     g_object_unref(service);
+    /* Stopping cancelled the accept in progress, which finishes -- letting go
+     * of the context it holds -- only when the context runs once more. */
+    while (g_main_context_pending(proxy->context)) {
+        g_main_context_iteration(proxy->context, FALSE);
+    }
     g_main_context_pop_thread_default(proxy->context);
     return NULL;
 }
