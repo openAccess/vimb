@@ -25,7 +25,8 @@
 #include "main.h"
 
 /* Operations on tabs, for whatever drives the browser rather than a person
- * at the keyboard: scripts (luascript.h), and in time the assistant and MCP.
+ * at the keyboard: scripts (luascript.h), the tools MCP clients and the
+ * assistant use (tools.h).
  * Each takes a callback, called once, from the main loop, when the operation
  * is over -- with its result as JSON, or why it failed.
  *
@@ -59,6 +60,9 @@ void ops_source(Client *c, OpsCallback callback, gpointer data);
 /* The http(s) links on the page, absolute, without fragments, once each, in
  * document order. */
 void ops_links(Client *c, OpsCallback callback, gpointer data);
+
+/* What the tab shows, as a PNG: value {"mime": "image/png", "data": base64}. */
+void ops_screenshot(Client *c, OpsCallback callback, gpointer data);
 
 /* The HTTP status of the page's main resource; 0 if none. */
 guint ops_status(Client *c);

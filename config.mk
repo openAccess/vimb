@@ -20,7 +20,7 @@ DOCDIR  = doc
 
 # used libs
 # gnutls, json-glib and zlib for src/archive/, which WebKitGTK uses anyway
-LIBS = gtk4 webkitgtk-6.0 gnutls json-glib-1.0 zlib libsoup-3.0 lua
+LIBS = gtk4 gio-unix-2.0 webkitgtk-6.0 gnutls json-glib-1.0 zlib libsoup-3.0 lua
 
 # setup general used CFLAGS
 # Use 'override' to ensure these flags are added even when CFLAGS is set on command line

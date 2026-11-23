@@ -43,12 +43,15 @@
 #include "util.h"
 #include "archiving.h"
 #include "luascript.h"
+#include "assistant.h"
 #include "ext-proxy.h"
 #include "autocmd.h"
 #include "util.h"
 
 typedef enum {
     EX_ARCHIVE,
+    EX_ASK,
+    EX_ASSISTANT,
 #ifdef FEATURE_AUTOCMD
     EX_AUTOCMD,
     EX_AUGROUP,
@@ -150,6 +153,7 @@ static VbCmdResult ex_augroup(Client *c, const ExArg *arg);
 static VbCmdResult ex_autocmd(Client *c, const ExArg *arg);
 #endif
 static VbCmdResult ex_archive(Client *c, const ExArg *arg);
+static VbCmdResult ex_assistant(Client *c, const ExArg *arg);
 static VbCmdResult ex_bookmark(Client *c, const ExArg *arg);
 static VbCmdResult ex_eval(Client *c, const ExArg *arg);
 static void on_eval_script_finished_usermessage(GObject *source_object,
@@ -197,6 +201,8 @@ static ExInfo commands[] = {
     {"augroup",          EX_AUGROUP,     ex_augroup,    EX_FLAG_LHS|EX_FLAG_BANG},
 #endif
     {"archive",          EX_ARCHIVE,     ex_archive,    EX_FLAG_RHS},
+    {"ask",              EX_ASK,         ex_assistant,  EX_FLAG_RHS},
+    {"assistant",        EX_ASSISTANT,   ex_assistant,  EX_FLAG_RHS},
     {"bma",              EX_BMA,         ex_bookmark,   EX_FLAG_RHS},
     {"bmr",              EX_BMR,         ex_bookmark,   EX_FLAG_RHS},
     {"cmap",             EX_CMAP,        ex_map,        EX_FLAG_LHS|EX_FLAG_CMD},
@@ -892,6 +898,14 @@ static VbCmdResult ex_lua(Client *c, const ExArg *arg)
 static VbCmdResult ex_archive(Client *c, const ExArg *arg)
 {
     return archiving_command(c, arg->rhs->str);
+}
+
+static VbCmdResult ex_assistant(Client *c, const ExArg *arg)
+{
+    if (arg->code == EX_ASK) {
+        return assistant_ask(c, arg->rhs->str);
+    }
+    return assistant_command(c, arg->rhs->str);
 }
 
 static VbCmdResult ex_bookmark(Client *c, const ExArg *arg)

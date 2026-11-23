@@ -312,6 +312,12 @@ struct Vimb {
     char        *script;            /* --script: a Lua script to run, then quit */
     gboolean    scripted;           /* nobody at the keyboard: dialogs answer themselves */
     int         exit_status;
+    GtkWidget   *paned;             /* the tabs, and beside them the assistant */
+    char        *assistant_task;    /* --assistant-task: given the assistant, then quit */
+    gboolean    mcp;                /* --mcp: serve MCP on stdin and stdout */
+    int         mcp_out;            /* stdout, kept for MCP; fd 1 is stderr then */
+    gboolean    mcp_allow_eval;
+    char        *mcp_allow_domains;
     int         window_width;       /* --window-size, or 0 */
     int         window_height;
 

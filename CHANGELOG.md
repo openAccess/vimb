@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   scope (`a:crawl{...}`). While a script runs, dialogs, permission requests
   and sign-in requests answer themselves. `--window-size WIDTHxHEIGHT` sets
   the window's size.
+* MCP: `--mcp` makes vimb a Model Context Protocol server on stdin and
+  stdout, whose tools open, read, scroll and screenshot pages, archive them
+  and crawl; `--mcp-allow-eval` adds running JavaScript, and
+  `--mcp-allow-domains` limits the sites that may be opened.
+  `contrib/python/vimb.py` drives it from Python with nothing else installed.
+* Assistant: `:ask TEXT` asks an AI model (Claude, by default
+  claude-opus-5-5, with `ANTHROPIC_API_KEY`) to browse and archive with the
+  same tools, answering in a pane beside the tabs; `:assistant` shows, hides,
+  stops and clears it. It opens only URLs that came from the user or from
+  pages. Settings `assistant`, `assistant-model` and `assistant-effort`.
+  `--assistant-task TEXT` runs one task headless and quits.
 
 ## Changed
 * Use webkit's built-in user-agent as default for setting `user-agent`

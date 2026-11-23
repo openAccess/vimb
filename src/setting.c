@@ -181,6 +181,10 @@ void setting_init(Client *c)
     setting_add(c, "archive-dir", TYPE_CHAR, &"", NULL, 0, NULL);
     /* Whether archiving may reach loopback and private addresses. */
     setting_add(c, "archive-allow-internal", TYPE_BOOLEAN, &off, NULL, 0, NULL);
+    /* The assistant (:ask): which model is behind it, and how hard it thinks. */
+    setting_add(c, "assistant", TYPE_CHAR, &"claude", NULL, 0, NULL);
+    setting_add(c, "assistant-model", TYPE_CHAR, &"", NULL, 0, NULL);
+    setting_add(c, "assistant-effort", TYPE_CHAR, &"medium", NULL, 0, NULL);
     setting_add(c, "status-bar", TYPE_BOOLEAN, &on, statusbar, 0, NULL);
     i = 1000;
     setting_add(c, "timeoutlen", TYPE_INTEGER, &i, internal, 0, &c->map.timeoutlen);

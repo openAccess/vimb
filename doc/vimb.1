@@ -76,6 +76,25 @@ To run without a display, run vimb under a virtual one:
 Xvfb :9 & DISPLAY=:9 GDK_BACKEND=x11 vimb --window-size 1280x900 --script crawl.lua
 .EE
 .TP
+.BI "\-\-assistant-task " TEXT
+Give the assistant (see \fBAssistant\fP) the task \fITEXT\fP, and quit when it
+is done: with status 0, or 1 if it failed.
+What it says, and the tools it uses, are printed on stderr.
+Archives it left recording are saved first.
+Nobody is taken to be at the keyboard, as with \fB\-\-script\fP.
+.TP
+.B "\-\-mcp"
+Serve the Model Context Protocol on stdin and stdout (see \fBMCP\fP), until
+stdin closes; then save any archive still recording, and quit.
+Nobody is taken to be at the keyboard, as with \fB\-\-script\fP.
+.TP
+.B "\-\-mcp-allow-eval"
+Offer MCP clients the run_javascript tool.
+.TP
+.BI "\-\-mcp-allow-domains " DOMAIN,...
+Let MCP clients open only URLs on these sites (each domain and those below
+it).
+.TP
 .BI "\-\-window-size " WIDTHxHEIGHT
 Open the window this size, and don't maximize it.
 What a page lays out, and so what it loads, depends on the size it is shown
@@ -808,6 +827,90 @@ a:crawl{seed = "https://example.org/", scope = "site", depth = 2}
 vimb.log("saved", a:stop())
 .EE
 .
+.SS Assistant
+An AI model that browses and archives for you, with the tools listed under
+\fBMCP\fP (but not run_javascript).
+It answers in a pane beside the tabs, showing what it does as it does it.
+It opens only URLs that you gave it \(em or pages of sites you named \(em and
+URLs that appeared in pages or in its tools' results; a URL it made up, which
+could carry away what it read, is refused.
+It is told to take what pages say as material to work on, not as instructions
+\(em which a model may not always manage, hence the limit on URLs.
+The setting \fBassistant\fP chooses the model behind it: `claude' (the
+default) needs an API key in \fBANTHROPIC_API_KEY\fP.
+.TP
+.BI ":ask " text
+Ask the assistant to do something; it is told which tab you are looking at.
+Without \fItext\fP, show the pane.
+.TP
+.B :assistant [show | hide | stop | clear | status]
+Toggle the pane, or show or hide it; stop what the assistant is doing; begin
+the conversation again; or say which model it is and whether it is working.
+.PP
+For example:
+.sp
+.EX
+:ask archive nytimes.com and the articles linked from its front page
+.EE
+.
+.SS MCP
+With \fB\-\-mcp\fP, vimb is a Model Context Protocol server: a program, or an
+AI assistant, drives it with the tools below, sending JSON-RPC messages a
+line each on vimb's stdin and reading the answers on its stdout.
+Tabs and archives are named by number.
+Only http and https URLs are opened.
+contrib/python/vimb.py is a client for Python that needs nothing else.
+.TP
+.B list_tabs
+The tabs: {tabs: [{tab, url, title, archiving}]}.
+.TP
+.BR open_page " {url, archive, timeout}"
+Open \fIurl\fP in a new tab \(em archiving into \fIarchive\fP, if given \(em
+and wait for it: {tab, url, status, title}.
+.TP
+.BR load_page " {tab, url, timeout}"
+.TP
+.BR read_page " {tab, format, offset, limit}"
+The page's \fBtext\fP (the default), its \fBhtml\fP as it is now, or its
+\fBsource\fP as the server sent it, \fIlimit\fP characters (50000) from
+\fIoffset\fP: {text, offset, length, truncated}.
+.TP
+.BR page_links " {tab}"
+{links: [{url, text}]}.
+.TP
+.BR scroll_page " {tab}"
+Read the page to its end: {screens, reached_end}.
+.TP
+.BR screenshot " {tab}"
+A PNG of what the tab shows.
+.TP
+.BR run_javascript " {tab, script}"
+With \fB\-\-mcp-allow-eval\fP only: {value}.
+.TP
+.BR close_tab " {tab}"
+.TP
+.BR start_archive " {name, strict_ssl, allow_internal}"
+{archive, name, state, responses}.
+.TP
+.BR archive_status " {archive}"
+.TP
+.BR stop_archive " {archive}"
+Save the archive: {archive, saved}.
+.TP
+.BR crawl " {archive, seeds, scope, pattern, depth, max_pages, max_seconds, delay, scroll}"
+As \fBa:crawl\fP in \fBScripting\fP.
+.PP
+For example, from Python:
+.sp
+.EX
+from vimb import Vimb
+with Vimb() as v:
+    a = v.start_archive(name="example")["archive"]
+    t = v.open_page(url="https://example.com/", archive=a)["tab"]
+    print(v.read_page(tab=t)["text"])
+    print(v.stop_archive(archive=a)["saved"])
+.EE
+.
 .SS Handlers
 Handlers allow specifying external scripts to handle alternative URI methods.
 .TP
@@ -1355,6 +1458,17 @@ the network vimb runs in.
 Directory archives are saved to.
 If empty, $XDG_DATA_HOME/vimb[/PROFILE]/archives is used.
 .TP
+.B assistant (string)
+The model behind the assistant: `claude'.
+Read when the assistant starts, or after \fB:assistant clear\fP.
+.TP
+.B assistant-effort (string)
+How hard the assistant thinks: `low', `medium' (the default), `high',
+`xhigh' or `max'.
+.TP
+.B assistant-model (string)
+The model, if not the default (for `claude', claude-opus-5-5).
+.TP
 .BR caret (bool)
 Whether to enable accessibility enhanced keyboard navigation.
 .TP
@@ -1827,6 +1941,12 @@ It is trusted only by archiving tabs.
 .RE
 .
 .SH ENVIRONMENT
+.TP
+.B ANTHROPIC_API_KEY
+The API key the assistant uses with `claude'.
+.TP
+.B ANTHROPIC_BASE_URL
+Where the Claude API is, if not at https://api.anthropic.com.
 .TP
 .B http_proxy, HTTP_PROXY
 If either environment variable is non-empty, the specified host and

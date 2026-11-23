@@ -43,6 +43,8 @@
 #include "ex.h"
 #include "archiving.h"
 #include "luascript.h"
+#include "mcp.h"
+#include "assistant.h"
 #include "ops.h"
 #include "ext-proxy.h"
 #include "handler.h"
@@ -2365,7 +2367,13 @@ static void create_main_window(void)
     gtk_notebook_set_show_tabs(GTK_NOTEBOOK(vb.notebook), FALSE);
 #endif
     gtk_widget_set_vexpand(vb.notebook, TRUE);
-    gtk_box_append(GTK_BOX(main_box), vb.notebook);
+    /* the assistant's pane, when there is one, goes beside the tabs */
+    vb.paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_set_start_child(GTK_PANED(vb.paned), vb.notebook);
+    gtk_paned_set_resize_start_child(GTK_PANED(vb.paned), TRUE);
+    gtk_paned_set_shrink_start_child(GTK_PANED(vb.paned), FALSE);
+    gtk_widget_set_vexpand(vb.paned, TRUE);
+    gtk_box_append(GTK_BOX(main_box), vb.paned);
 
     /* Connect notebook signals */
     g_signal_connect(vb.notebook, "switch-page", G_CALLBACK(on_notebook_switch_page), NULL);
@@ -3295,6 +3303,48 @@ static gboolean windowSizeOptionArgFunc(const gchar *option_name, const gchar *v
     return TRUE;
 }
 
+static void assistant_task_done(const char *error, gpointer data)
+{
+    if (error) {
+        fprintf(stderr, "vimb: the assistant's task failed: %s\n", error);
+    }
+    tools_release();                /* what it archived is saved as vimb quits */
+    vb_exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
+}
+
+/* --assistant-task, once the main loop runs. */
+static gboolean run_assistant_task(gpointer data)
+{
+    assistant_on_done(assistant_task_done, NULL);
+    if (assistant_ask(data, vb.assistant_task) != CMD_SUCCESS) {
+        vb_exit(EXIT_FAILURE);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean start_mcp(void)
+{
+    static ToolPolicy policy;
+    GError *error = NULL;
+
+    policy.allow_eval = vb.mcp_allow_eval;
+    /* the client is a program of the user's, which may want to crawl a
+     * site whatever its certificates */
+    policy.allow_archive_options = TRUE;
+    if (vb.mcp_allow_domains && *vb.mcp_allow_domains) {
+        policy.allowed_domains = g_strsplit(vb.mcp_allow_domains, ",", -1);
+        for (char **d = policy.allowed_domains; *d; d++) {
+            g_strstrip(*d);
+        }
+    }
+    if (!mcp_serve_stdio(STDIN_FILENO, vb.mcp_out, &policy, &error)) {
+        fprintf(stderr, "vimb: --mcp: %s\n", error->message);
+        g_error_free(error);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static gboolean run_script(gpointer data)
 {
     luascript_run_file(data, vb.script, TRUE);
@@ -3347,6 +3397,10 @@ int main(int argc, char* argv[])
         {"no-maximize", 0, 0, G_OPTION_ARG_NONE, &vb.no_maximize, "Do no attempt to maximize window", NULL},
         {"script", 0, 0, G_OPTION_ARG_FILENAME, &vb.script, "Run a Lua script, then quit", "FILE"},
         {"window-size", 0, 0, G_OPTION_ARG_CALLBACK, (GOptionArgFunc*)windowSizeOptionArgFunc, "Window size", "WIDTHxHEIGHT"},
+        {"assistant-task", 0, 0, G_OPTION_ARG_STRING, &vb.assistant_task, "Give the assistant a task, then quit when it is done", "TEXT"},
+        {"mcp", 0, 0, G_OPTION_ARG_NONE, &vb.mcp, "Serve the Model Context Protocol on stdin and stdout", NULL},
+        {"mcp-allow-eval", 0, 0, G_OPTION_ARG_NONE, &vb.mcp_allow_eval, "Let MCP clients run JavaScript in pages", NULL},
+        {"mcp-allow-domains", 0, 0, G_OPTION_ARG_STRING, &vb.mcp_allow_domains, "The only sites MCP clients may open", "DOMAIN,..."},
         {"bug-info", 0, 0, G_OPTION_ARG_NONE, &buginfo, "Print used library versions", NULL},
         {NULL}
     };
@@ -3364,7 +3418,21 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
     g_option_context_free(opt_context);
-    vb.scripted = vb.script != NULL;
+    vb.scripted = vb.script != NULL || vb.mcp || vb.assistant_task != NULL;
+    if (vb.mcp) {
+        if (vb.script || (argc > 1 && !strcmp(argv[argc - 1], "-"))) {
+            fprintf(stderr, "--mcp reads stdin, so it goes with neither --script nor -\n");
+            return EXIT_FAILURE;
+        }
+        /* MCP's messages go to stdout, and nothing else may: what else vimb
+         * or its libraries print goes to stderr */
+        vb.mcp_out = dup(STDOUT_FILENO);
+        if (vb.mcp_out < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
+            perror("vimb: --mcp");
+            return EXIT_FAILURE;
+        }
+        signal(SIGPIPE, SIG_IGN);
+    }
 
     /* initialize GTK+ */
     gtk_init();
@@ -3452,11 +3520,18 @@ int main(int argc, char* argv[])
     if (vb.script) {
         g_idle_add(run_script, c);
     }
+    if (vb.mcp && !start_mcp()) {
+        return EXIT_FAILURE;
+    }
+    if (vb.assistant_task) {
+        g_idle_add(run_assistant_task, c);
+    }
 
     /* GTK4: Use GMainLoop instead of gtk_main */
     main_loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(main_loop);
     g_main_loop_unref(main_loop);
+    assistant_shutdown();
     archiving_shutdown();
 #ifdef FREE_ON_QUIT
     vimb_cleanup();

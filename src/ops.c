@@ -384,6 +384,49 @@ void ops_source(Client *c, OpsCallback callback, gpointer data)
     webkit_web_resource_get_data(resource, NULL, on_source, call);
 }
 
+/* ---- screenshots ------------------------------------------------------- */
+
+static void on_snapshot(GObject *source, GAsyncResult *result, gpointer data)
+{
+    EvalCall *call      = data;
+    GError *error       = NULL;
+    GdkTexture *texture = webkit_web_view_get_snapshot_finish(WEBKIT_WEB_VIEW(source), result,
+            &error);
+    if (!texture) {
+        call->callback(FALSE, error->message, NULL, call->data);
+        g_error_free(error);
+    } else {
+        GBytes *png    = gdk_texture_save_to_png_bytes(texture);
+        gsize len;
+        const guchar *bytes = g_bytes_get_data(png, &len);
+        char *base64   = g_base64_encode(bytes, len);
+        JsonBuilder *b = json_builder_new();
+        json_builder_begin_object(b);
+        json_builder_set_member_name(b, "mime");
+        json_builder_add_string_value(b, "image/png");
+        json_builder_set_member_name(b, "data");
+        json_builder_add_string_value(b, base64);
+        json_builder_end_object(b);
+        JsonNode *value = json_builder_get_root(b);
+        call->callback(TRUE, NULL, value, call->data);
+        json_node_unref(value);
+        g_object_unref(b);
+        g_free(base64);
+        g_bytes_unref(png);
+        g_object_unref(texture);
+    }
+    g_free(call);
+}
+
+void ops_screenshot(Client *c, OpsCallback callback, gpointer data)
+{
+    EvalCall *call = g_new0(EvalCall, 1);
+    call->callback = callback;
+    call->data     = data;
+    webkit_web_view_get_snapshot(c->webview, WEBKIT_SNAPSHOT_REGION_VISIBLE,
+            WEBKIT_SNAPSHOT_OPTIONS_NONE, NULL, on_snapshot, call);
+}
+
 /* ---- scrolling --------------------------------------------------------- */
 
 typedef struct {

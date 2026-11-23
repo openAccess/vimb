@@ -409,8 +409,10 @@ static gboolean package_done(gpointer data)
     }
     update_status(a);
 
+    /* held meanwhile: a waiter may let go of it, which mustn't free it under us */
     GSList *waiters = a->waiters;
     a->waiters      = NULL;
+    a->holds++;
     for (GSList *l = waiters; l; l = l->next) {
         SavedWaiter *w = l->data;
         w->callback(a->saved, a->saved ? NULL : (a->error ? a->error->message : "unknown error"),
@@ -418,6 +420,7 @@ static gboolean package_done(gpointer data)
         g_free(w);
     }
     g_slist_free(waiters);
+    a->holds--;
 
     if (!a->tabs && !a->holds) {
         archive_free(a);
