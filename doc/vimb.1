@@ -729,6 +729,9 @@ and is recorded as it was sent, and so is everything loaded in tabs and
 popups opened from it.
 An archiving tab starts from nothing \(em no cookies, no cache, nobody signed
 in \(em so the archive holds what any visitor would be sent.
+A response whose content the archive already holds, under another URL say,
+is kept as a revisit, which says where that content is, rather than twice;
+and a websocket's messages are kept, each with when it came.
 The status bar of an archiving tab shows `[REC name]'.
 .TP
 .BI ":archive [" name ]
@@ -767,7 +770,12 @@ Everything the tab loads is answered from the archive and nothing from the
 web, as is everything loaded in tabs opened from it: a link followed to a
 page that wasn't archived comes to a page saying so, and why.
 Each page is replayed as it was when it was archived, and what it loads as it
-was then.
+was then; and the page's clock reads as it did then.
+What a page asks for anew each visit \(em with a reading of the clock in its
+address, or a random number, or an id made for the visit \(em is answered by
+what it was asked as when archived.
+A websocket is answered with the messages it carried, the page's own waited
+for as they were.
 The status bar of a replaying tab shows `[REPLAY name]', and
 \fB:archive status\fP says how many requests the archive answered, and how
 many it couldn't.

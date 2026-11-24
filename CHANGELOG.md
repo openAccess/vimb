@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the archive alone -- never from the network -- each page as it was when
   archived. What wasn't archived comes to a page saying so, and why. Also
   `vimb.replay()` for scripts and `replay_archive` for MCP and the assistant.
+* Archiving keeps a response whose content it already holds as a revisit
+  record (WARC 1.1's identical-payload-digest profile), and a websocket's
+  messages in a record of their own. Replay follows revisits, its own and
+  other tools'; answers what a page asks for anew each visit -- cache
+  busters, clock readings, ids made for the visit -- with what was archived;
+  plays websockets back; and sets a replayed page's clock to its capture's.
 * Unattended runs: `--assistant-task-file FILE`, `--summary FILE` (what
   the run came to, as JSON), and `--timeout SECONDS` (stop, save, exit 2).
   `contrib/container` builds an image that runs vimb under Xvfb for an

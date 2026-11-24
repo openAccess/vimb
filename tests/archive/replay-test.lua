@@ -13,7 +13,15 @@ end
 -- the index and the pages it links to; c.html, two links away, isn't archived
 local a = assert(vimb.archive.start{name = "replay source"})
 local crawled = assert(a:crawl{seed = base .. "index.html", depth = 1, scope = "host", delay = 0})
+-- a page loading one stylesheet by two names: the second is a revisit
+local dup = assert(a:open(base .. "dup.html"))
+dup:close()
+-- a page that writes the time it loaded at, by its own clock
+local clock = assert(a:open(base .. "clock.html"))
+local captured_at = tonumber(clock:eval("document.getElementById('now').textContent"))
+clock:close()
 local path = assert(a:stop())
+vimb.sleep(6)                       -- so that replay's time and the capture's differ
 check("archived", crawled.loaded == 3, crawled.loaded .. " pages, " .. path)
 
 -- replay begins at the list of what the archive holds
@@ -21,7 +29,7 @@ local t, info = vimb.replay(path)
 check("replay opens", t and info and info.status == 200, info and info.title)
 check("a replay tab says so", t and t.archiving)
 local listed = t and t:links() or {}
-check("the list links the pages", #listed == 3, table.concat(listed, " "))
+check("the list links the pages", #listed == 5, table.concat(listed, " "))
 
 -- archived pages come back
 info = t:load(base .. "index.html")
@@ -47,6 +55,22 @@ info = t:load(base .. "index.html")
 t:eval("document.querySelector('a[href=\"a.html\"]').click()")
 vimb.sleep(1.5)
 check("a link followed is replayed", t.title == "Page A" and t.archiving, t.title)
+
+-- a revisit replays with the payload it refers to
+info = t:load(base .. "big-copy.css")
+check("a revisit replays", info and info.status == 200
+      and t:text():find("the same stylesheet, by two names") ~= nil, info and info.status)
+
+-- a replayed page's clock reads as the capture's did, not as the real one
+info = t:load(base .. "clock.html")
+local replayed_at = tonumber(t:eval("document.getElementById('now').textContent"))
+local origin_at = tonumber(t:eval("document.getElementById('origin').textContent"))
+local real_now = tonumber(t:eval("Date.now()"))      -- vimb's own world keeps the real clock
+check("a replayed page reads the capture's clock", replayed_at and captured_at
+      and math.abs(replayed_at - captured_at) < 3000 and real_now - replayed_at > 4000,
+      string.format("captured %s, replayed %s, really %s", captured_at, replayed_at, real_now))
+check("and so do performance's times", origin_at and math.abs(origin_at - replayed_at) < 1000,
+      origin_at)
 
 -- the same archive opened again shares the replay
 local t2, info2 = vimb.replay(path, base .. "a.html")

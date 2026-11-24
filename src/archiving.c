@@ -93,6 +93,7 @@ typedef struct {
 static GList *archives;
 static GHashTable *page_states;     /* Client * -> PageState * */
 static GPtrArray *saved_paths;      /* every WACZ saved in this run */
+static GHashTable *clocks;          /* replaying Client * -> its clock's WebKitUserScript */
 
 static void note_saved(const char *path)
 {
@@ -663,6 +664,9 @@ void archiving_tab_closed(Client *c)
         g_free(ps);
     }
     c->archive = NULL;
+    if (clocks) {
+        g_hash_table_remove(clocks, c);
+    }
     /* A script keeping the archive may open its next tab after this one. */
     if (!a || --a->tabs || a->holds) {
         return;
@@ -821,6 +825,79 @@ static struct Archive *replay_start(Client *c, const char *path, GError **error)
     update_status(a);
     archives = g_list_prepend(archives, a);
     return a;
+}
+
+/* A replayed page's clock: Date, and what reads the time without it, start
+ * at the moment the page was captured, and run on from there -- as a page
+ * written against that clock expects. A page that caches what it fetched
+ * for five minutes, read on today's clock, would find it all stale, and
+ * "posted an hour ago" would be years out. (Workers keep the real clock.) */
+static const char clock_script[] =
+    "(function () {\n"
+    "  if (window.__vimbReplayClock) return;\n"
+    "  const moment = %" G_GINT64_FORMAT ";\n"
+    "  const RealDate = Date, realNow = Date.now;\n"
+    "  const offset = moment - realNow.call(RealDate);\n"
+    "  const now = () => realNow.call(RealDate) + offset;\n"
+    "  function ReplayDate(...args) {\n"
+    "    if (!new.target) return new RealDate(now()).toString();\n"
+    "    return Reflect.construct(RealDate, args.length ? args : [now()], new.target);\n"
+    "  }\n"
+    "  Object.defineProperties(ReplayDate, {\n"
+    "    prototype: {value: RealDate.prototype},\n"
+    "    length: {value: 7},\n"
+    "    name: {value: 'Date'},\n"
+    "    now: {value: now, writable: true, configurable: true},\n"
+    "    parse: {value: RealDate.parse, writable: true, configurable: true},\n"
+    "    UTC: {value: RealDate.UTC, writable: true, configurable: true},\n"
+    "    toString: {value: () => RealDate.toString(), writable: true, configurable: true}\n"
+    "  });\n"
+    "  Object.defineProperty(RealDate.prototype, 'constructor',\n"
+    "      {value: ReplayDate, writable: true, configurable: true});\n"
+    "  window.Date = ReplayDate;\n"
+    "  try {\n"
+    "    const origin = performance.timeOrigin + offset;\n"
+    "    Object.defineProperty(Performance.prototype, 'timeOrigin',\n"
+    "        {get: () => origin, configurable: true});\n"
+    "  } catch (e) {}\n"
+    "  try {\n"
+    "    const proto = Intl.DateTimeFormat.prototype;\n"
+    "    const format = Object.getOwnPropertyDescriptor(proto, 'format');\n"
+    "    Object.defineProperty(proto, 'format', {configurable: true, get() {\n"
+    "      const f = format.get.call(this);\n"
+    "      return (d) => f(d === undefined ? now() : d);\n"
+    "    }});\n"
+    "    const parts = proto.formatToParts;\n"
+    "    proto.formatToParts = function (d) { return parts.call(this, d === undefined ? now() : d); };\n"
+    "  } catch (e) {}\n"
+    "  Object.defineProperty(window, '__vimbReplayClock', {value: moment});\n"
+    "})();\n";
+
+void archiving_replay_clock(Client *c, const char *url, const char *referer)
+{
+    struct Archive *a = c->archive;
+    if (!a || !a->replay || !url || g_str_has_prefix(url, ARCHIVE_REPLAY_HOME)) {
+        return;
+    }
+    gint64 moment = archive_replay_page_moment(a->replay, url, referer);
+    if (!moment) {
+        return;
+    }
+    if (!clocks) {
+        clocks = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                (GDestroyNotify)webkit_user_script_unref);
+    }
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(c->webview);
+    WebKitUserScript *old = g_hash_table_lookup(clocks, c);
+    if (old) {
+        webkit_user_content_manager_remove_script(ucm, old);
+    }
+    char *source = g_strdup_printf(clock_script, moment * 1000);
+    WebKitUserScript *script = webkit_user_script_new(source, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    g_free(source);
+    webkit_user_content_manager_add_script(ucm, script);
+    g_hash_table_replace(clocks, c, script);
 }
 
 /* Where a replay begins: its only page, or the list of them. */

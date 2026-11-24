@@ -195,7 +195,7 @@ gboolean warc_writer_write(WarcWriter *writer, const WarcRecordInfo *info,
         GError **error)
 {
     if (!field_ok(info->target_uri) || !field_ok(info->content_type)
-            || !field_ok(info->ip_address)) {
+            || !field_ok(info->ip_address) || !field_ok(info->refers_to_uri)) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                 "A WARC header value would span lines");
         return FALSE;
@@ -229,6 +229,10 @@ gboolean warc_writer_write(WarcWriter *writer, const WarcRecordInfo *info,
     if (!strcmp(info->type, "warcinfo")) {
         add_field(head, "WARC-Filename", writer->filename);
     }
+    add_field(head, "WARC-Profile", info->profile);
+    add_field(head, "WARC-Refers-To", info->refers_to);
+    add_field(head, "WARC-Refers-To-Target-URI", info->refers_to_uri);
+    add_field(head, "WARC-Refers-To-Date", info->refers_to_date);
     add_field(head, "WARC-Truncated", info->truncated);
     add_field(head, "WARC-Block-Digest", block_digest);
     add_field(head, "WARC-Payload-Digest", info->payload_digest);

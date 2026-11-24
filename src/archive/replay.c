@@ -24,6 +24,8 @@
 
 #include "replay.h"
 #include "request_key.h"
+#include "surt.h"
+#include "websocket.h"
 #include "zip.h"
 
 #define INDEX_MAX   ((gsize)2 << 30)        /* an index, uncompressed */
@@ -32,21 +34,20 @@
 #define HEAD_MAX    (1 << 20)               /* a recorded response's head */
 
 typedef struct {
-    char   *line;           /* owned; key, ts and json point into it */
-    char   *key;
-    char   *ts;
-    char   *json;
-} Entry;
-
-/* What a lookup needs of an entry's JSON. */
-typedef struct {
-    guint   status;
-    char    *mime;
+    char    *line;          /* owned; key, ts and json point into it */
+    char    *key;
+    char    *ts;
+    char    *json;
+    /* what lookups need of the JSON, read once */
     char    *url;
+    char    *mime;
+    char    *digest;
     char    *filename;
     guint64 offset;
     guint64 length;
-} EntryInfo;
+    guint   status;
+    gint64  at;             /* ts, in seconds */
+} Entry;
 
 struct ArchiveReplay {
     ArchiveZipReader *zip;
@@ -160,7 +161,171 @@ static int compare_entries(gconstpointer a, gconstpointer b)
 static void entry_free(Entry *e)
 {
     g_free(e->line);
+    g_free(e->url);
+    g_free(e->mime);
+    g_free(e->digest);
+    g_free(e->filename);
     g_free(e);
+}
+
+/* A JSON string, from just after its opening quote; NULL if it isn't one. */
+static char *json_string(const char **p)
+{
+    GString *s = g_string_new(NULL);
+    const char *c = *p;
+    while (*c && *c != '"') {
+        if (*c != '\\') {
+            g_string_append_c(s, *c++);
+            continue;
+        }
+        c++;
+        switch (*c) {
+            case 'n': g_string_append_c(s, '\n'); c++; break;
+            case 't': g_string_append_c(s, '\t'); c++; break;
+            case 'r': g_string_append_c(s, '\r'); c++; break;
+            case 'b': g_string_append_c(s, '\b'); c++; break;
+            case 'f': g_string_append_c(s, '\f'); c++; break;
+            case 'u': {
+                gunichar u = 0;
+                for (int i = 1; i <= 4; i++) {
+                    if (!g_ascii_isxdigit(c[i])) {
+                        g_string_free(s, TRUE);
+                        return NULL;
+                    }
+                    u = u * 16 + g_ascii_xdigit_value(c[i]);
+                }
+                c += 5;
+                if (u >= 0xd800 && u < 0xdc00 && c[0] == '\\' && c[1] == 'u') {
+                    gunichar low = 0;
+                    gboolean hex = TRUE;
+                    for (int i = 2; i <= 5 && hex; i++) {
+                        hex = g_ascii_isxdigit(c[i]);
+                        low = hex ? low * 16 + g_ascii_xdigit_value(c[i]) : 0;
+                    }
+                    if (hex && low >= 0xdc00 && low < 0xe000) {
+                        u = 0x10000 + ((u - 0xd800) << 10) + (low - 0xdc00);
+                        c += 6;
+                    }
+                }
+                g_string_append_unichar(s, u);
+                break;
+            }
+            case '\0':
+                g_string_free(s, TRUE);
+                return NULL;
+            default:                /* \" \\ \/ */
+                g_string_append_c(s, *c++);
+        }
+    }
+    if (*c != '"') {
+        g_string_free(s, TRUE);
+        return NULL;
+    }
+    *p = c + 1;
+    return g_string_free(s, FALSE);
+}
+
+static void take_field(Entry *e, const char *name, char *value)
+{
+    char **field = !strcmp(name, "url") ? &e->url : !strcmp(name, "mime") ? &e->mime
+        : !strcmp(name, "digest") ? &e->digest : !strcmp(name, "filename") ? &e->filename : NULL;
+    if (field) {
+        g_free(*field);
+        *field = value;
+        return;
+    }
+    if (!strcmp(name, "status")) {
+        e->status = (guint)g_ascii_strtoull(value, NULL, 10);
+    } else if (!strcmp(name, "offset")) {
+        e->offset = g_ascii_strtoull(value, NULL, 10);
+    } else if (!strcmp(name, "length")) {
+        e->length = g_ascii_strtoull(value, NULL, 10);
+    }
+    g_free(value);
+}
+
+/* Reads the flat object of strings and numbers an index line ends with, as
+ * indexers write it -- faster than a JSON parser, read for every line. */
+static gboolean read_flat_json(Entry *e)
+{
+    const char *p = e->json;
+    if (*p++ != '{') {
+        return FALSE;
+    }
+    for (;;) {
+        while (g_ascii_isspace(*p)) {
+            p++;
+        }
+        if (*p == '}') {
+            return TRUE;
+        }
+        if (*p++ != '"') {
+            return FALSE;
+        }
+        char *name = json_string(&p);
+        while (name && g_ascii_isspace(*p)) {
+            p++;
+        }
+        if (!name || *p++ != ':') {
+            g_free(name);
+            return FALSE;
+        }
+        while (g_ascii_isspace(*p)) {
+            p++;
+        }
+        char *value = NULL;
+        if (*p == '"') {
+            p++;
+            value = json_string(&p);
+        } else if (*p != '{' && *p != '[') {
+            const char *v = p;
+            while (*p && *p != ',' && *p != '}' && !g_ascii_isspace(*p)) {
+                p++;
+            }
+            value = g_strndup(v, p - v);
+        }
+        if (!value) {
+            g_free(name);
+            return FALSE;           /* nested: the slow way */
+        }
+        take_field(e, name, value);
+        g_free(name);
+        while (g_ascii_isspace(*p)) {
+            p++;
+        }
+        if (*p == ',') {
+            p++;
+        } else if (*p != '}') {
+            return FALSE;
+        }
+    }
+}
+
+/* What a lookup needs of an entry, however its JSON is written. */
+static void read_entry_json(Entry *e)
+{
+    if (!read_flat_json(e)) {
+        JsonParser *parser = json_parser_new();
+        if (json_parser_load_from_data(parser, e->json, -1, NULL)
+                && JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser))) {
+            JsonObjectIter iter;
+            const char *name;
+            JsonNode *value;
+            json_object_iter_init(&iter, json_node_get_object(json_parser_get_root(parser)));
+            while (json_object_iter_next(&iter, &name, &value)) {
+                if (JSON_NODE_HOLDS_VALUE(value)) {
+                    take_field(e, name, json_node_get_value_type(value) == G_TYPE_STRING
+                            ? g_strdup(json_node_get_string(value))
+                            : g_strdup_printf("%" G_GINT64_FORMAT, json_node_get_int(value)));
+                }
+            }
+        }
+        g_object_unref(parser);
+    }
+    e->url      = e->url ? e->url : g_strdup("");
+    e->mime     = e->mime ? e->mime : g_strdup("");
+    e->filename = e->filename ? e->filename : g_strdup("");
+    e->at = seconds_of(e->ts);
 }
 
 static gboolean load_index(ArchiveReplay *r, GError **error)
@@ -216,6 +381,7 @@ static gboolean load_index(ArchiveReplay *r, GError **error)
         e->json  = e->line + (sp2 - line) + 1;
         e->ts[-1]   = '\0';
         e->json[-1] = '\0';
+        read_entry_json(e);
         if (r->entries->len && compare_entries(&g_ptr_array_index(r->entries,
                         r->entries->len - 1), &e) > 0) {
             sorted = FALSE;
@@ -340,6 +506,28 @@ const char *archive_replay_title(ArchiveReplay *r)
     return r->title;
 }
 
+static char *without_fragment(const char *url);
+static gint64 moment_for(ArchiveReplay *r, const char *url, const char *referer, gboolean page);
+
+gint64 archive_replay_page_moment(ArchiveReplay *r, const char *url, const char *referer)
+{
+    char *bare = without_fragment(url);
+    char *from = referer ? without_fragment(referer) : NULL;
+    g_mutex_lock(&r->lock);
+    gint64 moment = moment_for(r, bare, from, TRUE);
+    g_mutex_unlock(&r->lock);
+    g_free(from);
+    g_free(bare);
+    /* nothing to go by yet: the first page's moment, or the first capture's */
+    if (!moment && r->pages->len) {
+        moment = seconds_of(((ArchiveReplayPage *)g_ptr_array_index(r->pages, 0))->ts);
+    }
+    if (!moment && r->entries->len) {
+        moment = ((Entry *)g_ptr_array_index(r->entries, 0))->at;
+    }
+    return moment;
+}
+
 void archive_replay_counts(ArchiveReplay *r, guint *served, guint *missed)
 {
     g_mutex_lock(&r->lock);
@@ -350,8 +538,7 @@ void archive_replay_counts(ArchiveReplay *r, guint *served, guint *missed)
 
 /* ---- finding ------------------------------------------------------------ */
 
-/* The first entry whose key is not less than key (or, with prefix, that
- * doesn't sort before keys starting with it). */
+/* The first entry whose key is not less than key. */
 static guint lower_bound(ArchiveReplay *r, const char *key)
 {
     guint lo = 0, hi = r->entries->len;
@@ -367,71 +554,573 @@ static guint lower_bound(ArchiveReplay *r, const char *key)
     return lo;
 }
 
-static void info_clear(EntryInfo *info)
+typedef gboolean (*Accept)(const Entry *e, gconstpointer data);
+
+/* What a lookup is for: what was asked, and whether as a page. */
+typedef struct {
+    const char *url;
+    gboolean   page;
+} Asked;
+
+static gboolean whole(const Entry *e, gconstpointer data)
 {
-    g_free(info->mime);
-    g_free(info->url);
-    g_free(info->filename);
+    return e->status != 206;
 }
 
-static gboolean info_of(const Entry *e, EntryInfo *info)
+static gboolean whole_of_this_url(const Entry *e, gconstpointer data)
 {
-    memset(info, 0, sizeof(*info));
-    JsonParser *parser = json_parser_new();
-    gboolean ok = json_parser_load_from_data(parser, e->json, -1, NULL)
-        && JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser));
-    if (ok) {
-        JsonObject *o = json_node_get_object(json_parser_get_root(parser));
-        const char *status = json_object_get_string_member_with_default(o, "status", "0");
-        info->status   = (guint)g_ascii_strtoull(status, NULL, 10);
-        info->mime     = g_strdup(json_object_get_string_member_with_default(o, "mime", ""));
-        info->url      = g_strdup(json_object_get_string_member_with_default(o, "url", ""));
-        info->filename = g_strdup(json_object_get_string_member_with_default(o, "filename", ""));
-        info->offset   = g_ascii_strtoull(json_object_get_string_member_with_default(o, "offset",
-                    "0"), NULL, 10);
-        info->length   = g_ascii_strtoull(json_object_get_string_member_with_default(o, "length",
-                    "0"), NULL, 10);
-    }
-    g_object_unref(parser);
-    return ok;
+    return whole(e, data) && !strcmp(e->url, ((const Asked *)data)->url);
 }
 
-static gboolean refused(guint status)
+static gboolean any_of_this_url(const Entry *e, gconstpointer data)
 {
-    return status == 401 || status == 403 || status == 429;
+    return !strcmp(e->url, ((const Asked *)data)->url);
 }
 
-/* Of the captures of key, the one to answer with: a whole one before part
- * of one, for a page one the site let in before one it refused, and of
- * those, the nearest moment (the earliest, with no moment). Revisits wait
- * for a reader that can follow them. */
-static const Entry *best_capture(ArchiveReplay *r, const char *key, gint64 moment, gboolean page)
+static gboolean any(const Entry *e, gconstpointer data)
+{
+    return TRUE;
+}
+
+static gboolean a_page(const Entry *e, gconstpointer data)
+{
+    return e->status >= 200 && e->status < 300;
+}
+
+/* Whether the site turned the visitor away for the moment -- a sign-in
+ * wall, a bot check, too many asks -- rather than answering for the page. */
+static gboolean turned_away(const Entry *e)
+{
+    return e->status == 401 || e->status == 403 || e->status == 429;
+}
+
+/* Whether an entry may answer: not a websocket's messages, which answer
+ * only its handshake; accepted; and, asked, not a turning away. */
+static gboolean acceptable(const Entry *e, Accept accept, gconstpointer data, gboolean not_away)
+{
+    return strcmp(e->mime, ARCHIVE_WEBSOCKET_MIME) && accept(e, data)
+        && !(not_away && turned_away(e));
+}
+
+static gint64 distance(const Entry *e, gint64 moment)
+{
+    return moment ? llabs(e->at - moment) : e->at;      /* no moment: the earliest */
+}
+
+/* Of the captures filed under key exactly, the accepted one nearest moment. */
+static const Entry *find_nearest(ArchiveReplay *r, const char *key, gint64 moment, Accept accept,
+        gconstpointer data, gboolean not_away)
 {
     const Entry *best = NULL;
-    int best_rank     = G_MAXINT;
-    gint64 best_far   = G_MAXINT64;
+    gint64 best_far   = 0;
     for (guint i = lower_bound(r, key); i < r->entries->len; i++) {
         const Entry *e = g_ptr_array_index(r->entries, i);
         if (strcmp(e->key, key)) {
             break;
         }
-        EntryInfo info;
-        if (!info_of(e, &info)) {
-            continue;
+        if (acceptable(e, accept, data, not_away) && (!best || distance(e, moment) < best_far)) {
+            best     = e;
+            best_far = distance(e, moment);
         }
-        if (strcmp(info.mime, "warc/revisit")) {
-            int rank   = (info.status == 206 ? 2 : 0) + (page && refused(info.status) ? 1 : 0);
-            gint64 at  = seconds_of(e->ts);
-            gint64 far = moment ? llabs(at - moment) : at;
-            if (rank < best_rank || (rank == best_rank && far < best_far)) {
-                best      = e;
-                best_rank = rank;
-                best_far  = far;
-            }
-        }
-        info_clear(&info);
     }
     return best;
+}
+
+/* Calls visit with each capture of key's path -- the key before its "?" --
+ * by any method and query, which sort together after it, though not just
+ * after: "/a-b" sorts between "/a" and "/a?". */
+static void each_capture_of_path(ArchiveReplay *r, const char *key,
+        void (*visit)(const Entry *e, const char *query, gpointer data), gpointer data)
+{
+    const char *q = strchr(key, '?');
+    char *path    = q ? g_strndup(key, q - key) : g_strdup(key);
+    gsize n       = strlen(path);
+    char *with_query = g_strconcat(path, "?", NULL);
+    for (guint i = lower_bound(r, path); i < r->entries->len; i++) {
+        const Entry *e = g_ptr_array_index(r->entries, i);
+        if (strcmp(e->key, path)) {
+            break;
+        }
+        visit(e, "", data);
+    }
+    for (guint i = lower_bound(r, with_query); i < r->entries->len; i++) {
+        const Entry *e = g_ptr_array_index(r->entries, i);
+        if (strncmp(e->key, with_query, n + 1)) {
+            break;
+        }
+        visit(e, e->key + n + 1, data);
+    }
+    g_free(with_query);
+    g_free(path);
+}
+
+/* The method a key files its capture under, upper-cased: the one it names in
+ * its query (__wb_method), or GET. */
+static char *key_method(const char *query)
+{
+    char **terms = g_strsplit(query ? query : "", "&", -1);
+    char *method = NULL;
+    for (char **t = terms; *t && !method; t++) {
+        if (g_str_has_prefix(*t, "__wb_method=")) {
+            method = g_ascii_strup(*t + strlen("__wb_method="), -1);
+        }
+    }
+    g_strfreev(terms);
+    return method ? method : g_strdup("GET");
+}
+
+static const char *query_of(const char *key)
+{
+    const char *q = strchr(key, '?');
+    return q ? q + 1 : "";
+}
+
+/* A query as parameters: name -> values (a GPtrArray of char *, sorted); a
+ * name alone has the empty value. The method is left out. */
+static GHashTable *parameters_of(const char *query)
+{
+    GHashTable *params = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+            (GDestroyNotify)g_ptr_array_unref);
+    char **terms = g_strsplit(query, "&", -1);
+    for (char **t = terms; *t; t++) {
+        if (!**t) {
+            continue;
+        }
+        char *eq   = strchr(*t, '=');
+        char *name = eq ? g_strndup(*t, eq - *t) : g_strdup(*t);
+        if (!strcmp(name, "__wb_method")) {
+            g_free(name);
+            continue;
+        }
+        GPtrArray *values = g_hash_table_lookup(params, name);
+        if (!values) {
+            values = g_ptr_array_new_with_free_func(g_free);
+            g_hash_table_insert(params, g_strdup(name), values);
+        }
+        g_ptr_array_add(values, g_strdup(eq ? eq + 1 : ""));
+        g_free(name);
+    }
+    g_strfreev(terms);
+    GHashTableIter iter;
+    gpointer values;
+    g_hash_table_iter_init(&iter, params);
+    while (g_hash_table_iter_next(&iter, NULL, &values)) {
+        g_ptr_array_sort(values, (GCompareFunc)g_strcmp0);
+    }
+    return params;
+}
+
+/* How well a capture's query stands in for the one asked: a term both have
+ * counts 2, a name both have 1; one only either has, -1. */
+static int agreement(GHashTable *wanted, GHashTable *candidate)
+{
+    int score = 0;
+    GHashTableIter iter;
+    gpointer name, values;
+    g_hash_table_iter_init(&iter, wanted);
+    while (g_hash_table_iter_next(&iter, &name, &values)) {
+        GPtrArray *want = values, *have = g_hash_table_lookup(candidate, name);
+        for (guint i = 0; i < want->len; i++) {
+            gboolean same = FALSE;
+            for (guint j = 0; have && j < have->len && !same; j++) {
+                same = !strcmp(g_ptr_array_index(want, i), g_ptr_array_index(have, j));
+            }
+            score += same ? 2 : have ? 1 : -1;
+        }
+    }
+    g_hash_table_iter_init(&iter, candidate);
+    while (g_hash_table_iter_next(&iter, &name, NULL)) {
+        if (!g_hash_table_contains(wanted, name)) {
+            score -= 1;
+        }
+    }
+    return score;
+}
+
+/* "scheme://host[:port]/", the start every URL from an origin has. */
+static char *origin_prefix(const char *url)
+{
+    const char *scheme_end = url ? strstr(url, "://") : NULL;
+    const char *path = scheme_end ? strchr(scheme_end + 3, '/') : NULL;
+    return scheme_end ? (path ? g_strndup(url, path - url + 1) : g_strconcat(url, "/", NULL))
+        : NULL;
+}
+
+typedef struct {
+    Accept       accept;
+    gconstpointer data;
+    gboolean     not_away;
+    gint64       moment;
+    char         *method;
+    GHashTable   *wanted;
+    char         *origin;       /* the asked URL's */
+    const Entry  *best;
+    int          best_score;
+    gboolean     best_same_origin;
+    gint64       best_far;
+} Search;
+
+static void search_init(Search *s, const char *key, gint64 moment, Accept accept,
+        gconstpointer data, gboolean not_away)
+{
+    memset(s, 0, sizeof(*s));
+    s->accept   = accept;
+    s->data     = data;
+    s->not_away = not_away;
+    s->moment   = moment;
+    s->method   = key_method(query_of(key));
+    s->wanted   = parameters_of(query_of(key));
+    s->origin   = origin_prefix(((const Asked *)data)->url);
+}
+
+static void search_clear(Search *s)
+{
+    g_free(s->method);
+    g_free(s->origin);
+    g_hash_table_unref(s->wanted);
+}
+
+static gboolean search_considers(Search *s, const Entry *e, const char *query)
+{
+    if (!acceptable(e, s->accept, s->data, s->not_away)) {
+        return FALSE;
+    }
+    char *method = key_method(query);
+    gboolean same = !strcmp(method, s->method);
+    g_free(method);
+    return same;
+}
+
+/* Of two stand-ins, the one that agrees more; then one from the asked URL's
+ * own origin -- another, filed under the same key for SURT drops "www.", is
+ * as a rule a redirect to it, and would send a page round for ever; then the
+ * nearer. */
+static void search_offer(Search *s, const Entry *e, int score)
+{
+    gint64 far = distance(e, s->moment);
+    gboolean same = s->origin && g_str_has_prefix(e->url, s->origin);
+    if (!s->best || score > s->best_score
+            || (score == s->best_score && same && !s->best_same_origin)
+            || (score == s->best_score && same == s->best_same_origin && far < s->best_far)) {
+        s->best             = e;
+        s->best_score       = score;
+        s->best_same_origin = same;
+        s->best_far         = far;
+    }
+}
+
+static void visit_closest(const Entry *e, const char *query, gpointer data)
+{
+    Search *s = data;
+    if (search_considers(s, e, query)) {
+        GHashTable *candidate = parameters_of(query);
+        search_offer(s, e, agreement(s->wanted, candidate));
+        g_hash_table_unref(candidate);
+    }
+}
+
+/* For what a page loads: of the captures of key's path by its method, the
+ * one whose query agrees most with key's, and of those, the nearest. What a
+ * page loads asks anew each time with something new in it. */
+static const Entry *find_closest(ArchiveReplay *r, const char *key, gint64 moment, Accept accept,
+        gconstpointer data, gboolean not_away)
+{
+    Search s;
+    search_init(&s, key, moment, accept, data, not_away);
+    each_capture_of_path(r, key, visit_closest, &s);
+    search_clear(&s);
+    return s.best;
+}
+
+/* ---- values a load makes for itself ---- */
+
+typedef enum {
+    KIND_CHOSEN,                /* by whoever wrote the URL, for all that can be told */
+    KIND_EMPTY,                 /* nothing yet */
+    KIND_CLOCK,
+    KIND_RANDOM,
+    KIND_ID,
+} ValueKind;
+
+#define CLOCK_REACH (24 * 3600)     /* how far a reading of the clock may stray */
+
+static gboolean is_clock_reading(const char *v, gint64 moment)
+{
+    gsize n = strlen(v);
+    if (!moment || (n != 10 && n != 13)) {
+        return FALSE;
+    }
+    for (const char *c = v; *c; c++) {
+        if (!g_ascii_isdigit(*c)) {
+            return FALSE;
+        }
+    }
+    gint64 reading = (gint64)g_ascii_strtoull(v, NULL, 10);
+    if (n == 13) {
+        reading /= 1000;
+    }
+    return llabs(reading - moment) <= CLOCK_REACH;
+}
+
+static gboolean is_random_fraction(const char *v)
+{
+    if (strlen(v) < 8 || !g_str_has_prefix(v, "0.")) {
+        return FALSE;
+    }
+    for (const char *c = v + 2; *c; c++) {
+        if (!g_ascii_isdigit(*c)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static gboolean is_uuid(const char *t, gsize n)
+{
+    if (n != 36) {
+        return FALSE;
+    }
+    for (gsize i = 0; i < n; i++) {
+        gboolean dash = i == 8 || i == 13 || i == 18 || i == 23;
+        if (dash ? t[i] != '-' : !g_ascii_isxdigit(t[i])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* 16 hex digits or more, letters and digits both: all digits is a number a
+ * site counts out, all letters a word. */
+static gboolean is_hex_id(const char *t, gsize n)
+{
+    gboolean digit = FALSE, alpha = FALSE;
+    if (n < 16) {
+        return FALSE;
+    }
+    for (gsize i = 0; i < n; i++) {
+        if (!g_ascii_isxdigit(t[i])) {
+            return FALSE;
+        }
+        digit |= g_ascii_isdigit(t[i]);
+        alpha |= g_ascii_isalpha(t[i]);
+    }
+    return digit && alpha;
+}
+
+/* An id alone, or ids among punctuation, as a page strings them together. */
+static gboolean is_made_id(const char *v)
+{
+    gboolean found = FALSE;
+    const char *c = v;
+    while (*c) {
+        if (!g_ascii_isalnum(*c) && *c != '-') {
+            c++;
+            continue;
+        }
+        const char *start = c;
+        while (*c && (g_ascii_isalnum(*c) || *c == '-')) {
+            c++;
+        }
+        if (!is_uuid(start, c - start) && !is_hex_id(start, c - start)) {
+            return FALSE;
+        }
+        found = TRUE;
+    }
+    return found;
+}
+
+static ValueKind kind_of(const char *v, gint64 moment)
+{
+    static const char *empties[] = {"", "null", "undefined", "nan", "false", "0", NULL};
+    for (int i = 0; empties[i]; i++) {
+        if (!g_ascii_strcasecmp(v, empties[i])) {
+            return KIND_EMPTY;
+        }
+    }
+    return is_clock_reading(v, moment) ? KIND_CLOCK : is_random_fraction(v) ? KIND_RANDOM
+        : is_made_id(v) ? KIND_ID : KIND_CHOSEN;
+}
+
+/* Whether the values a parameter was given in two queries (NULL: not given)
+ * differ only as those a load makes for itself do: a value made for the visit
+ * where the other had none yet, or another reading of the clock, or another
+ * roll of the die -- but never another id, which may name another thing. */
+static gboolean differ_only_as_visit_values(GPtrArray *want, gint64 want_at, GPtrArray *have,
+        gint64 have_at)
+{
+    guint wn = want ? want->len : 0, hn = have ? have->len : 0;
+    if (wn == hn) {
+        gboolean same = TRUE;
+        for (guint i = 0; i < wn && same; i++) {
+            same = !strcmp(g_ptr_array_index(want, i), g_ptr_array_index(have, i));
+        }
+        if (same) {
+            return TRUE;
+        }
+    }
+    if (wn > 1 || hn > 1) {
+        return FALSE;               /* a list is chosen */
+    }
+    ValueKind a = wn ? kind_of(g_ptr_array_index(want, 0), want_at) : KIND_EMPTY;
+    ValueKind b = hn ? kind_of(g_ptr_array_index(have, 0), have_at) : KIND_EMPTY;
+    if (a == KIND_CHOSEN || b == KIND_CHOSEN) {
+        return FALSE;
+    }
+    if (a == KIND_EMPTY || b == KIND_EMPTY) {
+        return a != b;
+    }
+    return a == b && a != KIND_ID;
+}
+
+static void visit_ignoring_visit_values(const Entry *e, const char *query, gpointer data)
+{
+    Search *s = data;
+    if (!search_considers(s, e, query)) {
+        return;
+    }
+    GHashTable *have = parameters_of(query);
+    gboolean ok = TRUE;
+    GHashTableIter iter;
+    gpointer name, values;
+    g_hash_table_iter_init(&iter, s->wanted);
+    while (ok && g_hash_table_iter_next(&iter, &name, &values)) {
+        ok = differ_only_as_visit_values(values, s->moment, g_hash_table_lookup(have, name), e->at);
+    }
+    g_hash_table_iter_init(&iter, have);
+    while (ok && g_hash_table_iter_next(&iter, &name, &values)) {
+        ok = g_hash_table_contains(s->wanted, name)
+            || differ_only_as_visit_values(NULL, s->moment, values, e->at);
+    }
+    g_hash_table_unref(have);
+    if (ok) {
+        search_offer(s, e, 0);
+    }
+}
+
+/* For a page: the capture of key's path, by its method, whose query is key's
+ * once what each load makes anew is set aside -- the consent frame a news
+ * site opens with an id made for the visit -- and of those, the nearest. */
+static const Entry *find_ignoring_visit_values(ArchiveReplay *r, const char *key, gint64 moment,
+        Accept accept, gconstpointer data, gboolean not_away)
+{
+    Search s;
+    search_init(&s, key, moment, accept, data, not_away);
+    each_capture_of_path(r, key, visit_ignoring_visit_values, &s);
+    search_clear(&s);
+    return s.best;
+}
+
+/* A query value as it reads: "+" a space, escapes undone. */
+static char *unescaped(const char *v)
+{
+    char *spaced = g_strdelimit(g_strdup(v), "+", ' ');
+    char *plain  = g_uri_unescape_string(spaced, NULL);
+    g_free(spaced);
+    return plain ? plain : g_strdup(v);
+}
+
+static void visit_fewer_parameters(const Entry *e, const char *query, gpointer data)
+{
+    Search *s = data;
+    if (!search_considers(s, e, query)) {
+        return;
+    }
+    GHashTable *have = parameters_of(query);
+    int shared = 0;
+    gboolean ok = TRUE;
+    GHashTableIter iter;
+    gpointer name, values;
+    g_hash_table_iter_init(&iter, have);
+    while (ok && g_hash_table_iter_next(&iter, &name, &values)) {
+        GPtrArray *want = g_hash_table_lookup(s->wanted, name);
+        GPtrArray *vs   = values;
+        ok = want != NULL;
+        for (guint i = 0; ok && i < vs->len; i++) {
+            char *reads = unescaped(g_ptr_array_index(vs, i));
+            gboolean asked = FALSE;
+            for (guint j = 0; j < want->len && !asked; j++) {
+                char *a = unescaped(g_ptr_array_index(want, j));
+                asked = !strcmp(a, reads);
+                g_free(a);
+            }
+            g_free(reads);
+            ok = asked;
+            shared++;
+        }
+    }
+    g_hash_table_unref(have);
+    if (ok) {
+        search_offer(s, e, shared);
+    }
+}
+
+/* For a page that added to its own address and reloads: the capture of the
+ * address it added to -- every parameter the capture's is the request's too,
+ * with its value -- sharing the most with it, and the nearest of those. */
+static const Entry *find_with_fewer_parameters(ArchiveReplay *r, const char *key, gint64 moment,
+        Accept accept, gconstpointer data)
+{
+    Search s;
+    search_init(&s, key, moment, accept, data, FALSE);
+    each_capture_of_path(r, key, visit_fewer_parameters, &s);
+    search_clear(&s);
+    return s.best;
+}
+
+typedef const Entry *(*Finder)(ArchiveReplay *r, const char *key, gint64 moment, Accept accept,
+        gconstpointer data, gboolean not_away);
+
+/* For a page, a capture the site let the visitor into before a nearer one in
+ * which it turned them away: replayed, a bot check that reloads once satisfied
+ * would be refused again at the same moment, and reload for ever. */
+static const Entry *let_in_first(Finder find, ArchiveReplay *r, const char *key, gint64 moment,
+        Accept accept, const Asked *asked)
+{
+    const Entry *e = asked->page ? find(r, key, moment, accept, asked, TRUE) : NULL;
+    return e ? e : find(r, key, moment, accept, asked, FALSE);
+}
+
+/* The capture to answer a request with -- in the order the Chromium fork
+ * looks, from the capture of the very thing asked, to what stands in for it:
+ *
+ *   - filed under the request's key (a HEAD the capture never made, under a
+ *     GET's), nearest the moment: a whole capture of the very URL; a whole
+ *     one; a part of the very URL; any. Another URL may share a key -- SURT
+ *     drops the scheme and "www." -- and is as a rule a redirect to the one
+ *     asked, which would send the page round for ever;
+ *   - then what comes nearest: for what a page loads, the capture of its path
+ *     whose query agrees most; for a page, one differing only in what the
+ *     load made for itself;
+ *   - last, for a page, the address it added to -- answered with a page,
+ *     never a redirect, which could send it on round again. */
+static const Entry *lookup(ArchiveReplay *r, const Asked *asked, const char *method,
+        const char *content_type, const guint8 *body, gsize body_len, gint64 moment)
+{
+    char *keys[3] = {archive_request_key(asked->url, method, content_type, body,
+            (gssize)body_len), NULL, NULL};
+    if (!g_ascii_strcasecmp(method, "HEAD")) {
+        keys[1] = archive_surt(asked->url);
+    }
+    static const Accept nearest_tiers[] = {whole_of_this_url, whole, any_of_this_url, any};
+    static const Accept closest_tiers[] = {whole, any};
+    const Entry *e = NULL;
+    for (int k = 0; keys[k] && !e; k++) {
+        for (gsize t = 0; t < G_N_ELEMENTS(nearest_tiers) && !e; t++) {
+            e = let_in_first(find_nearest, r, keys[k], moment, nearest_tiers[t], asked);
+        }
+    }
+    for (int k = 0; keys[k] && !e; k++) {
+        for (gsize t = 0; t < G_N_ELEMENTS(closest_tiers) && !e; t++) {
+            e = let_in_first(asked->page ? find_ignoring_visit_values : find_closest, r, keys[k],
+                    moment, closest_tiers[t], asked);
+        }
+    }
+    for (int k = 0; keys[k] && !e && asked->page; k++) {
+        e = find_with_fewer_parameters(r, keys[k], moment, a_page, asked);
+    }
+    g_free(keys[0]);
+    g_free(keys[1]);
+    return e;
 }
 
 /* Whether any key starts with prefix, followed by what follow allows (any
@@ -516,7 +1205,7 @@ static gboolean is_page(const Http1Head *head)
 /* The moment to answer a request at: a page's own, from the page list;
  * else that of what asked for it (the Referer), or of its site's last page;
  * else the last page's. Called locked. */
-static gint64 moment_for(ArchiveReplay *r, const char *url, const Http1Head *head, gboolean page)
+static gint64 moment_for(ArchiveReplay *r, const char *url, const char *referer, gboolean page)
 {
     if (page) {
         for (guint i = 0; i < r->pages->len; i++) {
@@ -529,7 +1218,6 @@ static gint64 moment_for(ArchiveReplay *r, const char *url, const Http1Head *hea
             }
         }
     }
-    const char *referer = http1_head_get(head, "Referer");
     if (referer) {
         char *from = without_fragment(referer);
         gpointer at = g_hash_table_lookup(r->moments, from);
@@ -606,144 +1294,319 @@ static char *http_date(gint64 seconds)
     return s;
 }
 
-/* A recorded response, made into one for the browser. */
-static GBytes *answer_from(ArchiveReplay *r, const Entry *e, const EntryInfo *info,
-        const ArchiveReplayRequest *request, GError **error)
+/* A record, read out of the archive. */
+typedef struct {
+    GByteArray   *data;
+    char         *type;
+    char         *content_type;
+    char         *refers_to_uri;
+    char         *refers_to_date;
+    char         *payload_digest;
+    const guint8 *block;
+    gsize        block_len;
+} Record;
+
+static void record_clear(Record *rec)
 {
-    char *name = g_strconcat("archive/", info->filename, NULL);
+    if (rec->data) {
+        g_byte_array_unref(rec->data);
+    }
+    g_free(rec->type);
+    g_free(rec->content_type);
+    g_free(rec->refers_to_uri);
+    g_free(rec->refers_to_date);
+    g_free(rec->payload_digest);
+    memset(rec, 0, sizeof(*rec));
+}
+
+static gboolean read_record(ArchiveReplay *r, const Entry *e, Record *rec, GError **error)
+{
+    memset(rec, 0, sizeof(*rec));
+    char *name = g_strconcat("archive/", e->filename, NULL);
     const ArchiveZipEntry *ze = archive_zip_find(r->zip, name);
     g_free(name);
-    if (!ze || !info->length || info->length > RECORD_MAX) {
-        g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "no record for %s", info->url);
-        return NULL;
+    if (!ze || !e->length || e->length > RECORD_MAX) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "no record for %s", e->url);
+        return FALSE;
     }
-    guint8 *raw = g_malloc(info->length);
-    if (!archive_zip_read_at(r->zip, ze, info->offset, raw, info->length, error)) {
+    guint8 *raw = g_malloc(e->length);
+    if (!archive_zip_read_at(r->zip, ze, e->offset, raw, e->length, error)) {
         g_free(raw);
-        return NULL;
+        return FALSE;
     }
-    GByteArray *record;
-    if (g_str_has_suffix(info->filename, ".gz")) {
-        record = gunzip(raw, info->length, RECORD_MAX, error);
+    if (g_str_has_suffix(e->filename, ".gz")) {
+        rec->data = gunzip(raw, e->length, RECORD_MAX, error);
         g_free(raw);
-        if (!record) {
-            return NULL;
+        if (!rec->data) {
+            return FALSE;
         }
     } else {
-        record = g_byte_array_new_take(raw, info->length);
+        rec->data = g_byte_array_new_take(raw, e->length);
     }
 
-    /* the record: its WARC headers, then its block */
-    const char *start = (const char *)record->data;
-    const char *sep   = g_strstr_len(start, MIN(record->len, HEAD_MAX), "\r\n\r\n");
+    /* its WARC headers, then its block */
+    const char *start = (const char *)rec->data->data;
+    const char *sep   = g_strstr_len(start, MIN(rec->data->len, HEAD_MAX), "\r\n\r\n");
     if (!sep) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "not a WARC record");
-        g_byte_array_unref(record);
-        return NULL;
+        record_clear(rec);
+        return FALSE;
     }
-    char *warc_head = g_strndup(start, sep - start);
-    char *type = NULL, *content_type = NULL;
+    char *head = g_strndup(start, sep - start);
     guint64 block_len = 0;
-    char **lines = g_strsplit(warc_head, "\r\n", -1);
+    char **lines = g_strsplit(head, "\r\n", -1);
     for (char **l = lines; *l; l++) {
         char *colon = strchr(*l, ':');
         if (!colon) {
             continue;
         }
         *colon = '\0';
-        const char *value = g_strstrip(colon + 1);
-        if (!g_ascii_strcasecmp(*l, "WARC-Type")) {
-            type = g_strdup(value);
-        } else if (!g_ascii_strcasecmp(*l, "Content-Type")) {
-            content_type = g_strdup(value);
+        const char *v = g_strstrip(colon + 1);
+        char **field = !g_ascii_strcasecmp(*l, "WARC-Type") ? &rec->type
+            : !g_ascii_strcasecmp(*l, "Content-Type") ? &rec->content_type
+            : !g_ascii_strcasecmp(*l, "WARC-Refers-To-Target-URI") ? &rec->refers_to_uri
+            : !g_ascii_strcasecmp(*l, "WARC-Refers-To-Date") ? &rec->refers_to_date
+            : !g_ascii_strcasecmp(*l, "WARC-Payload-Digest") ? &rec->payload_digest : NULL;
+        if (field) {
+            g_free(*field);
+            *field = g_strdup(v);
         } else if (!g_ascii_strcasecmp(*l, "Content-Length")) {
-            block_len = g_ascii_strtoull(value, NULL, 10);
+            block_len = g_ascii_strtoull(v, NULL, 10);
         }
     }
     g_strfreev(lines);
-    g_free(warc_head);
-    const guint8 *block = (const guint8 *)sep + 4;
-    gsize avail = record->len - (block - record->data);
-    gsize len   = MIN(block_len ? block_len : avail, avail);
+    g_free(head);
+    rec->block     = (const guint8 *)sep + 4;
+    gsize avail    = rec->data->len - (rec->block - rec->data->data);
+    rec->block_len = MIN(block_len ? block_len : avail, avail);
+    return TRUE;
+}
 
-    guint status = 200;
-    char *reason = g_strdup("OK");
-    GPtrArray *headers = g_ptr_array_new_with_free_func(g_free);
-    GByteArray *body = g_byte_array_new();
-    gboolean ok = TRUE;
-    if (!g_strcmp0(type, "response")) {
-        Http1Parser *p = http1_parser_new(HTTP1_RESPONSE, HEAD_MAX);
-        http1_parser_set_request_method(p, "GET");
-        http1_parser_set_payload_func(p, append_payload, body);
-        GError *perr = NULL;
-        gssize used = http1_parser_feed(p, block, len, &perr);
-        if (used >= 0 && !http1_parser_is_done(p)) {
-            http1_parser_eof(p, NULL);      /* a body cut short is served as held */
+/* An HTTP response, ready to send on. */
+typedef struct {
+    guint      status;
+    char       *reason;
+    GPtrArray  *headers;        /* "Name: value", hop by hop gone */
+    GByteArray *body;           /* de-chunked, still in its content coding */
+} Response;
+
+static void response_init(Response *resp)
+{
+    memset(resp, 0, sizeof(*resp));
+    resp->status  = 200;
+    resp->reason  = g_strdup("OK");
+    resp->headers = g_ptr_array_new_with_free_func(g_free);
+    resp->body    = g_byte_array_new();
+}
+
+static void response_clear(Response *resp)
+{
+    g_free(resp->reason);
+    if (resp->headers) {
+        g_ptr_array_unref(resp->headers);
+    }
+    if (resp->body) {
+        g_byte_array_unref(resp->body);
+    }
+    memset(resp, 0, sizeof(*resp));
+}
+
+/* The HTTP response a block holds; with head_only, its head alone -- a
+ * revisit's, which a writer may end without the blank line. */
+static gboolean parse_response(const guint8 *block, gsize len, gboolean head_only, Response *resp,
+        GError **error)
+{
+    GByteArray *head = NULL;
+    if (head_only) {
+        head = g_byte_array_sized_new(len + 4);
+        g_byte_array_append(head, block, len);
+        if (!g_strstr_len((const char *)head->data, head->len, "\r\n\r\n")) {
+            gboolean line_ended = len >= 2 && block[len - 2] == '\r' && block[len - 1] == '\n';
+            g_byte_array_append(head, (const guint8 *)"\r\n\r\n", line_ended ? 2 : 4);
         }
-        if (!http1_parser_has_head(p)) {
-            g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "a response without a head: %s",
-                    perr ? perr->message : "");
-            ok = FALSE;
-        } else {
-            const Http1Head *h = http1_parser_head(p);
-            status = h->status;
-            g_free(reason);
-            reason = g_strdup(h->reason ? h->reason : "");
-            for (guint i = 0; i < h->headers->len; i++) {
-                Http1Header *hd = &g_array_index(h->headers, Http1Header, i);
-                if (!hop_by_hop(hd->name)) {
-                    g_ptr_array_add(headers, g_strdup_printf("%s: %s", hd->name, hd->value));
-                }
+        block = head->data;
+        len   = head->len;
+    }
+    Http1Parser *p = http1_parser_new(HTTP1_RESPONSE, HEAD_MAX);
+    /* as for a HEAD, no body follows the head of a revisit */
+    http1_parser_set_request_method(p, head_only ? "HEAD" : "GET");
+    http1_parser_set_payload_func(p, append_payload, resp->body);
+    GError *perr = NULL;
+    gssize used = http1_parser_feed(p, block, len, &perr);
+    if (used >= 0 && !http1_parser_is_done(p)) {
+        http1_parser_eof(p, NULL);          /* a body cut short is served as held */
+    }
+    gboolean ok = http1_parser_has_head(p);
+    if (!ok) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "a response without a head%s%s",
+                perr ? ": " : "", perr ? perr->message : "");
+    } else {
+        const Http1Head *h = http1_parser_head(p);
+        resp->status = h->status;
+        g_free(resp->reason);
+        resp->reason = g_strdup(h->reason ? h->reason : "");
+        for (guint i = 0; i < h->headers->len; i++) {
+            Http1Header *hd = &g_array_index(h->headers, Http1Header, i);
+            if (!hop_by_hop(hd->name)) {
+                g_ptr_array_add(resp->headers, g_strdup_printf("%s: %s", hd->name, hd->value));
             }
         }
-        g_clear_error(&perr);
-        http1_parser_free(p);
-    } else if (!g_strcmp0(type, "resource")) {
-        g_ptr_array_add(headers, g_strdup_printf("Content-Type: %s",
-                    content_type ? content_type : "application/octet-stream"));
-        g_byte_array_append(body, block, len);
+    }
+    g_clear_error(&perr);
+    http1_parser_free(p);
+    if (head) {
+        g_byte_array_unref(head);
+    }
+    return ok;
+}
+
+static const char *digest_value(const char *digest)
+{
+    const char *colon = digest ? strchr(digest, ':') : NULL;
+    return colon ? colon + 1 : digest;      /* "sha1:AB..." or "AB..." */
+}
+
+typedef struct {
+    const Entry *revisit;
+    const char  *digest;
+    const char  *target;
+} Revisited;
+
+/* A capture holding the payload: a response, not the revisit itself, whose
+ * digest agrees where both are known. */
+static gboolean holds_payload(const Entry *c, gconstpointer data)
+{
+    const Revisited *v = data;
+    if ((!strcmp(c->filename, v->revisit->filename) && c->offset == v->revisit->offset)
+            || !strcmp(c->mime, "warc/revisit")) {
+        return FALSE;
+    }
+    return !v->digest || !c->digest || !g_strcmp0(digest_value(c->digest), digest_value(v->digest));
+}
+
+static gboolean holds_payload_at_target(const Entry *c, gconstpointer data)
+{
+    return !strcmp(c->url, ((const Revisited *)data)->target) && holds_payload(c, data);
+}
+
+/* The capture holding what a revisit refers to: of the URL it names (its own,
+ * if none), nearest the date it names, with its digest; failing that, any
+ * capture in the archive with that digest. */
+static const Entry *find_revisited(ArchiveReplay *r, const Entry *e, const Record *rec)
+{
+    Revisited v = {
+        .revisit = e,
+        .digest  = e->digest ? e->digest : rec->payload_digest,
+        .target  = rec->refers_to_uri ? rec->refers_to_uri : e->url,
+    };
+    gint64 moment = e->at;
+    if (rec->refers_to_date) {
+        char *ts = archive_replay_index_time(rec->refers_to_date);
+        moment   = seconds_of(ts);
+        g_free(ts);
+    }
+    char *key = !strcmp(v.target, e->url) ? g_strdup(e->key) : archive_surt(v.target);
+    const Entry *found = NULL;
+    if (key) {
+        found = find_nearest(r, key, moment, holds_payload_at_target, &v, FALSE);
+        found = found ? found : find_nearest(r, key, moment, holds_payload, &v, FALSE);
+    }
+    g_free(key);
+    if (!found && v.digest) {
+        for (guint i = 0; i < r->entries->len; i++) {
+            const Entry *c = g_ptr_array_index(r->entries, i);
+            if (c->digest && holds_payload(c, &v)
+                    && (!found || distance(c, moment) < distance(found, moment))) {
+                found = c;
+            }
+        }
+    }
+    return found;
+}
+
+/* The response an entry holds: a response record's, a resource as a 200, or
+ * for a revisit, its own headers with the payload of what it refers to. */
+static gboolean read_response(ArchiveReplay *r, const Entry *e, Response *resp, int depth,
+        GError **error)
+{
+    Record rec;
+    if (!read_record(r, e, &rec, error)) {
+        return FALSE;
+    }
+    gboolean ok = FALSE;
+    response_init(resp);
+    if (!g_strcmp0(rec.type, "response")) {
+        ok = parse_response(rec.block, rec.block_len, FALSE, resp, error);
+    } else if (!g_strcmp0(rec.type, "resource")) {
+        g_ptr_array_add(resp->headers, g_strdup_printf("Content-Type: %s",
+                    rec.content_type ? rec.content_type : "application/octet-stream"));
+        g_byte_array_append(resp->body, rec.block, rec.block_len);
+        ok = TRUE;
+    } else if (!g_strcmp0(rec.type, "revisit") && depth == 0) {
+        const Entry *original = find_revisited(r, e, &rec);
+        Response orig, own;
+        if (!original) {
+            g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                    "the archive doesn't hold what %s revisits", e->url);
+        } else if (read_response(r, original, &orig, depth + 1, error)) {
+            ok = TRUE;
+            response_clear(resp);
+            response_init(&own);
+            /* its own headers, unless it has none, or the site said "not
+             * modified": then the original, as the capturing browser had it */
+            if (parse_response(rec.block, rec.block_len, TRUE, &own, NULL) && own.status != 304) {
+                g_byte_array_unref(own.body);
+                own.body  = orig.body;
+                orig.body = NULL;
+                *resp     = own;
+                response_clear(&orig);
+            } else {
+                response_clear(&own);
+                *resp = orig;
+            }
+        }
     } else {
         g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "a %s record can't answer",
-                type ? type : "untyped");
-        ok = FALSE;
+                rec.type ? rec.type : "untyped");
     }
-    g_free(type);
-    g_free(content_type);
-    g_byte_array_unref(record);
+    record_clear(&rec);
+    if (!ok) {
+        response_clear(resp);
+    }
+    return ok;
+}
 
-    GBytes *answer = NULL;
-    if (ok) {
-        gboolean head_only = !g_ascii_strcasecmp(request->method, "HEAD");
-        gsize from = 0, to = body->len ? body->len - 1 : 0;
-        gboolean ranged = status == 200 && asked_range(request->head, body->len, &from, &to);
-        GString *out = g_string_new(NULL);
-        if (ranged) {
-            g_string_append(out, "HTTP/1.1 206 Partial Content\r\n");
-        } else {
-            g_string_append_printf(out, "HTTP/1.1 %u %s\r\n", status, reason);
-        }
-        for (guint i = 0; i < headers->len; i++) {
-            g_string_append_printf(out, "%s\r\n", (char *)g_ptr_array_index(headers, i));
-        }
-        if (ranged) {
-            g_string_append_printf(out, "Content-Range: bytes %" G_GSIZE_FORMAT "-%"
-                    G_GSIZE_FORMAT "/%u\r\n", from, to, body->len);
-        }
-        gsize length = ranged ? to - from + 1 : body->len;
-        char *when = http_date(seconds_of(e->ts));
-        g_string_append_printf(out, "Content-Length: %" G_GSIZE_FORMAT "\r\n"
-                "Memento-Datetime: %s\r\n\r\n", length, when);
-        g_free(when);
-        if (!head_only && status != 204 && status != 304 && status >= 200) {
-            g_string_append_len(out, (const char *)body->data + (ranged ? from : 0), length);
-        }
-        gsize size = out->len;
-        answer = g_bytes_new_take(g_string_free(out, FALSE), size);
+/* A response made into one for the browser: framed by its length, a range of
+ * it if one was asked, and when it was captured. */
+static GBytes *answer_with(const Response *resp, gint64 captured,
+        const ArchiveReplayRequest *request)
+{
+    gboolean head_only = !g_ascii_strcasecmp(request->method, "HEAD");
+    gsize from = 0, to = resp->body->len ? resp->body->len - 1 : 0;
+    gboolean ranged = resp->status == 200 && asked_range(request->head, resp->body->len, &from, &to);
+    GString *out = g_string_new(NULL);
+    if (ranged) {
+        g_string_append(out, "HTTP/1.1 206 Partial Content\r\n");
+    } else {
+        g_string_append_printf(out, "HTTP/1.1 %u %s\r\n", resp->status, resp->reason);
     }
-    g_free(reason);
-    g_ptr_array_unref(headers);
-    g_byte_array_unref(body);
-    return answer;
+    for (guint i = 0; i < resp->headers->len; i++) {
+        g_string_append_printf(out, "%s\r\n", (char *)g_ptr_array_index(resp->headers, i));
+    }
+    if (ranged) {
+        g_string_append_printf(out, "Content-Range: bytes %" G_GSIZE_FORMAT "-%" G_GSIZE_FORMAT
+                "/%u\r\n", from, to, resp->body->len);
+    }
+    gsize length = ranged ? to - from + 1 : resp->body->len;
+    char *when = http_date(captured);
+    g_string_append_printf(out, "Content-Length: %" G_GSIZE_FORMAT "\r\nMemento-Datetime: %s\r\n\r\n",
+            length, when);
+    g_free(when);
+    if (!head_only && resp->status != 204 && resp->status != 304 && resp->status >= 200) {
+        g_string_append_len(out, (const char *)resp->body->data + (ranged ? from : 0), length);
+    }
+    gsize size = out->len;
+    return g_bytes_new_take(g_string_free(out, FALSE), size);
 }
 
 static GBytes *simple_answer(guint status, const char *reason, const char *type,
@@ -827,31 +1690,24 @@ GBytes *archive_replay_answer(ArchiveReplay *r, const ArchiveReplayRequest *requ
     const char *type = http1_head_get(request->head, "Content-Type");
 
     g_mutex_lock(&r->lock);
-    gint64 moment = moment_for(r, url, request->head, page);
+    gint64 moment = moment_for(r, url, http1_head_get(request->head, "Referer"), page);
     g_mutex_unlock(&r->lock);
 
-    char *key = archive_request_key(url, request->method, type, request->body,
-            (gssize)request->body_len);
-    const Entry *e = key ? best_capture(r, key, moment, page) : NULL;
-    if (!e && key && !g_ascii_strcasecmp(request->method, "HEAD")) {
-        /* a HEAD the capture never made: a GET's headers are what it'd say */
-        g_free(key);
-        key = archive_request_key(url, "GET", NULL, NULL, 0);
-        e   = key ? best_capture(r, key, moment, page) : NULL;
-    }
-
+    Asked asked = {.url = url, .page = page};
+    const Entry *e = lookup(r, &asked, request->method, type, request->body, request->body_len,
+            moment);
     GBytes *answer = NULL;
     GError *error  = NULL;
     if (e) {
-        EntryInfo info;
-        if (info_of(e, &info)) {
-            answer = answer_from(r, e, &info, request, &error);
-            info_clear(&info);
+        Response resp;
+        if (read_response(r, e, &resp, 0, &error)) {
+            answer = answer_with(&resp, e->at, request);
+            response_clear(&resp);
         }
     }
     g_mutex_lock(&r->lock);
     if (answer) {
-        gint64 at = seconds_of(e->ts);
+        gint64 at = e->at;
         r->served++;
         g_hash_table_replace(r->moments, g_strdup(url), GSIZE_TO_POINTER(at));
         if (page) {
@@ -866,6 +1722,8 @@ GBytes *archive_replay_answer(ArchiveReplay *r, const ArchiveReplayRequest *requ
     }
     g_mutex_unlock(&r->lock);
 
+    char *key = answer ? NULL : archive_request_key(url, request->method, type, request->body,
+            (gssize)request->body_len);
     if (!answer) {
         *found = FALSE;
         const char *why = error ? "The archive lists this, but its record can't be read."
@@ -879,4 +1737,75 @@ GBytes *archive_replay_answer(ArchiveReplay *r, const ArchiveReplayRequest *requ
     g_free(key);
     g_free(url);
     return answer;
+}
+
+/* ---- websockets ---------------------------------------------------------- */
+
+static gboolean switched(const Entry *e, gconstpointer data)
+{
+    return e->status == 101;
+}
+
+ArchiveReplayWebsocket *archive_replay_websocket(ArchiveReplay *r,
+        const ArchiveReplayRequest *request)
+{
+    char *url = without_fragment(request->url);
+    char *key = archive_surt(url);
+    g_mutex_lock(&r->lock);
+    gint64 moment = moment_for(r, url, http1_head_get(request->head, "Referer"), FALSE);
+    g_mutex_unlock(&r->lock);
+
+    /* its messages, nearest the moment */
+    const Entry *messages = NULL;
+    for (guint i = key ? lower_bound(r, key) : r->entries->len; i < r->entries->len; i++) {
+        const Entry *e = g_ptr_array_index(r->entries, i);
+        if (strcmp(e->key, key)) {
+            break;
+        }
+        if (!strcmp(e->mime, ARCHIVE_WEBSOCKET_MIME)
+                && (!messages || distance(e, moment) < distance(messages, moment))) {
+            messages = e;
+        }
+    }
+    ArchiveReplayWebsocket *ws = NULL;
+    Record rec;
+    if (messages && read_record(r, messages, &rec, NULL)) {
+        GPtrArray *read = ws_messages_read(rec.block, rec.block_len);
+        record_clear(&rec);
+        if (read) {
+            ws = g_new0(ArchiveReplayWebsocket, 1);
+            ws->messages = read;
+            /* the subprotocol its handshake agreed, if it did */
+            const Entry *handshake = find_nearest(r, key, messages->at, switched, NULL, FALSE);
+            Response resp;
+            if (handshake && read_response(r, handshake, &resp, 0, NULL)) {
+                for (guint i = 0; i < resp.headers->len && !ws->protocol; i++) {
+                    const char *h = g_ptr_array_index(resp.headers, i);
+                    if (!g_ascii_strncasecmp(h, "Sec-WebSocket-Protocol:", 23)) {
+                        ws->protocol = g_strstrip(g_strdup(h + 23));
+                    }
+                }
+                response_clear(&resp);
+            }
+        }
+    }
+    g_mutex_lock(&r->lock);
+    if (ws) {
+        r->served++;
+    } else {
+        r->missed++;
+    }
+    g_mutex_unlock(&r->lock);
+    g_free(key);
+    g_free(url);
+    return ws;
+}
+
+void archive_replay_websocket_free(ArchiveReplayWebsocket *ws)
+{
+    if (ws) {
+        g_ptr_array_unref(ws->messages);
+        g_free(ws->protocol);
+        g_free(ws);
+    }
 }

@@ -1,0 +1,7 @@
+<!doctype html><meta charset=utf-8><title>Clock</title>
+<p>What the page's own clock read as it loaded:</p>
+<p id=now></p><p id=origin></p>
+<script>
+document.getElementById('now').textContent = Date.now();
+document.getElementById('origin').textContent = Math.round(performance.timeOrigin + performance.now());
+</script>

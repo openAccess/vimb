@@ -77,6 +77,10 @@ const char *archiving_saved(struct Archive *archive);   /* the WACZ, once saved 
  * never from the network -- as do tabs opened from it. */
 VbCmdResult archiving_replay_command(Client *c, const char *args);
 
+/* Sets a replaying tab's clock to the moment the page at url, reached from
+ * referer, was captured -- before it loads. */
+void archiving_replay_clock(Client *c, const char *url, const char *referer);
+
 /* For scripts: a replay of the WACZ at path (the one open already, if it
  * is), to open tabs in with vb_tab_new_archive(); where it begins; how many
  * requests it answered, and couldn't. It ends with its last tab. */

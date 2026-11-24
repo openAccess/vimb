@@ -41,6 +41,10 @@
  * The index is read into memory; the records are read from the archive as
  * they're asked for. Any thread. */
 
+/* The content type of a record holding a websocket's messages (see
+ * recorder.h): it answers the websocket's handshake, and nothing else. */
+#define ARCHIVE_WEBSOCKET_MIME "application/x-vimb-websocket-messages"
+
 /* Where replay's own pages are: the list of what the archive holds. */
 #define ARCHIVE_REPLAY_HOME "http://replay.vimb/"
 
@@ -65,6 +69,11 @@ const char *archive_replay_title(ArchiveReplay *replay);
  * couldn't answer. */
 void archive_replay_counts(ArchiveReplay *replay, guint *served, guint *missed);
 
+/* The moment a page at url is replayed at -- as its request will be
+ * answered, referer being the page it was reached from -- in seconds since
+ * 1970: for setting a replayed page's clock. */
+gint64 archive_replay_page_moment(ArchiveReplay *replay, const char *url, const char *referer);
+
 typedef struct {
     const char      *method;
     const char      *url;       /* absolute */
@@ -77,6 +86,17 @@ typedef struct {
  * the archive, or saying what it doesn't hold and why. found says which. */
 GBytes *archive_replay_answer(ArchiveReplay *replay, const ArchiveReplayRequest *request,
         gboolean *found);
+
+/* For a websocket's handshake: the messages the archive holds of it, and
+ * the subprotocol its handshake agreed; NULL if it holds none. */
+typedef struct {
+    GPtrArray *messages;        /* of WsMessage (see websocket.h) */
+    char      *protocol;        /* Sec-WebSocket-Protocol, or NULL */
+} ArchiveReplayWebsocket;
+
+ArchiveReplayWebsocket *archive_replay_websocket(ArchiveReplay *replay,
+        const ArchiveReplayRequest *request);
+void archive_replay_websocket_free(ArchiveReplayWebsocket *ws);
 
 /* The 14 digits an index writes a time in, from those or from RFC 3339 as a
  * page list writes it ("2026-11-23T21:57:53Z"). */

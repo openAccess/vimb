@@ -39,7 +39,15 @@ typedef struct {
     const char *payload_digest; /* "sha1:..." when the block has a payload */
     const char *truncated;      /* WARC-Truncated: "length", "time", ... */
     GDateTime  *date;           /* NULL: now */
+    /* a revisit's: what it refers to, and by what profile */
+    const char *profile;        /* WARC-Profile */
+    const char *refers_to;      /* WARC-Refers-To: the record holding the payload */
+    const char *refers_to_uri;  /* WARC-Refers-To-Target-URI */
+    const char *refers_to_date; /* WARC-Refers-To-Date, as WARC-Date writes it */
 } WarcRecordInfo;
+
+/* The profile of a revisit whose payload another record holds, the same. */
+#define WARC_PROFILE_IDENTICAL "http://netpreserve.org/warc/1.1/revisit/identical-payload-digest"
 
 /* Makes path, which must not exist, and writes its warcinfo record. */
 WarcWriter *warc_writer_open(const char *path, const char *software, GError **error);

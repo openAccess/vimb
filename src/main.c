@@ -1685,6 +1685,10 @@ static void decide_navigation_action(Client *c, WebKitPolicyDecision *dec)
             autocmd_run(c, AU_LOAD_STARTING, uri, NULL);
         }
 #endif
+        if (c->archive) {
+            /* a replayed page's clock is the capture's, set before it loads */
+            archiving_replay_clock(c, uri, webkit_web_view_get_uri(c->webview));
+        }
         webkit_policy_decision_use(dec);
     }
 }

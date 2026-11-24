@@ -34,6 +34,7 @@
 #include "../../src/archive/surt.h"
 #include "../../src/archive/wacz.h"
 #include "../../src/archive/warc.h"
+#include "../../src/archive/websocket.h"
 #include "../../src/archive/zip.h"
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -1107,6 +1108,29 @@ static void write_at(WarcWriter *writer, const char *dir, const char *uri, const
     spool_free(resp);
 }
 
+static void write_revisit(WarcWriter *writer, const char *dir, const char *uri,
+        const char *target, const char *target_date, const char *payload, const char *head,
+        int day, int hour)
+{
+    Spool *block = spool_new(dir, 65536);
+    GDateTime *when = g_date_time_new_utc(2026, 1, day, hour, 0, 0);
+    guint8 sha1[20];
+    gsize len = sizeof(sha1);
+    GChecksum *sum = g_checksum_new(G_CHECKSUM_SHA1);
+    g_checksum_update(sum, (const guchar *)payload, -1);
+    g_checksum_get_digest(sum, sha1, &len);
+    g_checksum_free(sum);
+    char *digest = warc_label_sha1(sha1);
+    spool_append(block, head, strlen(head), NULL);
+    WarcRecordInfo r = {.type = "revisit", .target_uri = uri, .date = when,
+        .content_type = "application/http;msgtype=response", .payload_digest = digest,
+        .profile = WARC_PROFILE_IDENTICAL, .refers_to_uri = target, .refers_to_date = target_date};
+    g_assert_true(warc_writer_write(writer, &r, block, NULL, NULL, NULL, NULL));
+    g_date_time_unref(when);
+    g_free(digest);
+    spool_free(block);
+}
+
 #define PAGE_GET(path) "GET " path " HTTP/1.1\r\nHost: www.example.org\r\nSec-Fetch-Dest: document\r\n\r\n"
 #define SUB_GET(path)  "GET " path " HTTP/1.1\r\nHost: www.example.org\r\nSec-Fetch-Dest: style\r\n\r\n"
 
@@ -1181,6 +1205,21 @@ static void test_replay(void)
     write_at(w, capture, "https://www.example.org/chunked", SUB_GET("/chunked"),
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nStrict-Transport-Security: max-age=9"
             "\r\n\r\n4\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n", 2, 12);
+    /* the address without "www.", shares the page's key, and redirects to it */
+    write_at(w, capture, "https://example.org/", PAGE_GET("/"),
+            "HTTP/1.1 301 Moved\r\nLocation: https://www.example.org/\r\nContent-Length: 0\r\n\r\n",
+            2, 12);
+    /* a logo, and a revisit of it under another URL, and a script revisited
+     * at its own, whose revisit ends its head without the blank line */
+    write_at(w, capture, "https://www.example.org/logo.png", SUB_GET("/logo.png"),
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 7\r\n\r\nPNGDATA", 2, 12);
+    write_revisit(w, capture, "https://www.example.org/img/logo.png",
+            "https://www.example.org/logo.png", "2026-01-02T12:00:00Z", "PNGDATA",
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nX-Revisit: yes\r\n\r\n", 2, 14);
+    write_at(w, capture, "https://www.example.org/a.js", SUB_GET("/a.js"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nJS!", 1, 0);
+    write_revisit(w, capture, "https://www.example.org/a.js", NULL, NULL, "JS!",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Second: yes\r\n", 3, 0);
     /* two searches, told apart by what they sent */
     write_at(w, capture, "https://www.example.org/search",
             "POST /search HTTP/1.1\r\nHost: www.example.org\r\n"
@@ -1268,10 +1307,55 @@ static void test_replay(void)
     a = ask(replay, "https://other.example/", PAGE_GET("/"), &found);
     g_assert_nonnull(strstr(a, "from this site"));
     g_free(a);
-    a = ask(replay, "https://www.example.org/s.css?v=2", SUB_GET("/s.css?v=2"), &found);
+    /* a page asked for by a method it was never captured by */
+    a = ask(replay, "https://www.example.org/search", PAGE_GET("/search"), &found);
     g_assert_false(found);
-    g_assert_nonnull(strstr(a, "not with this query"));
+    g_assert_nonnull(strstr(a, "not by this method"));
+    g_free(a);
+    a = ask(replay, "https://www.example.org/nothing.js", SUB_GET("/nothing.js"), &found);
+    g_assert_false(found);
     g_assert_null(strstr(a, "<h1>"));       /* not a page: no page saying so */
+    g_free(a);
+
+    /* the very URL first: not the redirect filed under the same key */
+    a = ask(replay, "https://www.example.org/", PAGE_GET("/"), &found);
+    g_assert_cmpstr(body_of(a), ==, "let in");
+    g_free(a);
+    a = ask(replay, "https://example.org/", PAGE_GET("/"), &found);
+    g_assert_true(g_str_has_prefix(a, "HTTP/1.1 301 Moved\r\n"));
+    g_free(a);
+
+    /* what a page loads, asked anew with a cache-buster: the closest capture */
+    a = ask(replay, "https://www.example.org/s.css?v=2", SUB_GET("/s.css?v=2"), &found);
+    g_assert_true(found);
+    g_assert_cmpstr(body_of(a), ==, "near");
+    g_free(a);
+    /* a page asked with a reading of the clock, or an id made for the visit */
+    a = ask(replay, "https://www.example.org/?_=1767355200123", PAGE_GET("/?_=1767355200123"),
+            &found);
+    g_assert_cmpstr(body_of(a), ==, "let in");
+    g_free(a);
+    a = ask(replay, "https://www.example.org/?visit=9f3c2a1b7e6d5c4f", PAGE_GET("/?visit=9f3c2a1b7e6d5c4f"),
+            &found);
+    g_assert_cmpstr(body_of(a), ==, "let in");
+    g_free(a);
+    /* a page that added to its own address: what it added to, a page */
+    a = ask(replay, "https://www.example.org/?theme=dark", PAGE_GET("/?theme=dark"), &found);
+    g_assert_true(g_str_has_prefix(a, "HTTP/1.1 200 OK\r\n"));
+    g_assert_cmpstr(body_of(a), ==, "let in");
+    g_free(a);
+
+    /* revisits: their own headers, the payload of what they refer to */
+    a = ask(replay, "https://www.example.org/img/logo.png", SUB_GET("/img/logo.png"), &found);
+    g_assert_true(found);
+    g_assert_cmpstr(body_of(a), ==, "PNGDATA");
+    g_assert_nonnull(strstr(a, "X-Revisit: yes\r\n"));
+    g_assert_nonnull(strstr(a, "Content-Length: 7\r\n"));
+    g_free(a);
+    a = ask(replay, "https://www.example.org/a.js", "GET /a.js HTTP/1.1\r\nHost: x\r\n"
+            "Referer: https://www.example.org/later\r\n\r\n", &found);
+    g_assert_cmpstr(body_of(a), ==, "JS!");
+    g_assert_nonnull(strstr(a, "X-Second: yes\r\n"));
     g_free(a);
 
     /* replay's own list of what the archive holds */
@@ -1282,8 +1366,8 @@ static void test_replay(void)
 
     guint served, missed;
     archive_replay_counts(replay, &served, &missed);
-    g_assert_cmpuint(served, ==, 7);
-    g_assert_cmpuint(missed, ==, 3);
+    g_assert_cmpuint(served, ==, 15);
+    g_assert_cmpuint(missed, ==, 4);
     archive_replay_free(replay);
 
     /* what isn't a WACZ, or has no index */
@@ -1297,6 +1381,109 @@ static void test_replay(void)
     g_free(wacz);
     g_free(capture);
     g_free(dir);
+}
+
+/* ---- websockets ---------------------------------------------------------- */
+
+typedef struct {
+    GPtrArray *opcodes;         /* GUINT_TO_POINTER */
+    GPtrArray *payloads;        /* char * */
+} Heard;
+
+static void on_heard(guint opcode, const guint8 *data, gsize len, gpointer user)
+{
+    Heard *h = user;
+    g_ptr_array_add(h->opcodes, GUINT_TO_POINTER(opcode));
+    g_ptr_array_add(h->payloads, g_strndup((const char *)data, len));
+}
+
+static void test_websocket(void)
+{
+    /* RFC 6455's example of an accept */
+    char *accept = ws_accept("dGhlIHNhbXBsZSBub25jZQ==");
+    g_assert_cmpstr(accept, ==, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    g_free(accept);
+
+    Heard h = {g_ptr_array_new(), g_ptr_array_new_with_free_func(g_free)};
+    WsReader *r = ws_reader_new(on_heard, &h);
+    static const guint8 mask[4] = {0x37, 0xfa, 0x21, 0x3d};
+
+    /* a masked text frame, as a client sends it, fed a byte at a time */
+    GBytes *f = ws_frame(WS_TEXT, (const guint8 *)"Hello", 5, mask);
+    gsize n;
+    const guint8 *b = g_bytes_get_data(f, &n);
+    g_assert_cmpuint(n, ==, 11);
+    g_assert_cmpuint(b[1], ==, 0x85);
+    for (gsize i = 0; i < n; i++) {
+        g_assert_true(ws_reader_feed(r, b + i, 1));
+    }
+    g_bytes_unref(f);
+    g_assert_cmpuint(h.payloads->len, ==, 1);
+    g_assert_cmpstr(g_ptr_array_index(h.payloads, 0), ==, "Hello");
+
+    /* a fragmented message with a ping between its fragments (RFC 6455 5.4) */
+    static const guint8 fragments[] = {
+        0x01, 0x03, 'H', 'e', 'l',          /* text, not final */
+        0x89, 0x02, 'h', 'i',               /* ping */
+        0x80, 0x02, 'l', 'o',               /* continuation, final */
+    };
+    g_assert_true(ws_reader_feed(r, fragments, sizeof(fragments)));
+    g_assert_cmpuint(h.payloads->len, ==, 3);
+    g_assert_cmpuint(GPOINTER_TO_UINT(g_ptr_array_index(h.opcodes, 1)), ==, WS_PING);
+    g_assert_cmpstr(g_ptr_array_index(h.payloads, 1), ==, "hi");
+    g_assert_cmpuint(GPOINTER_TO_UINT(g_ptr_array_index(h.opcodes, 2)), ==, WS_TEXT);
+    g_assert_cmpstr(g_ptr_array_index(h.payloads, 2), ==, "Hello");
+
+    /* lengths of 16 and 64 bits */
+    GString *big = g_string_new(NULL);
+    for (int i = 0; i < 70000; i++) {
+        g_string_append_c(big, 'a' + i % 26);
+    }
+    for (gsize len = 300; len <= 70000; len += 69700) {
+        f = ws_frame(WS_BINARY, (const guint8 *)big->str, len, NULL);
+        b = g_bytes_get_data(f, &n);
+        g_assert_cmpuint(n, ==, len + (len > 0xffff ? 10 : 4));
+        g_assert_true(ws_reader_feed(r, b, n));
+        g_bytes_unref(f);
+        g_assert_cmpuint(strlen(g_ptr_array_index(h.payloads, h.payloads->len - 1)), ==, len);
+    }
+    g_string_free(big, TRUE);
+
+    /* compressed frames (an extension's bit) are not read */
+    static const guint8 compressed[] = {0xc1, 0x01, 'x'};
+    g_assert_false(ws_reader_feed(r, compressed, sizeof(compressed)));
+    ws_reader_free(r);
+
+    /* the messages, as a record keeps them, and back */
+    GPtrArray *messages = g_ptr_array_new_with_free_func((GDestroyNotify)ws_message_free);
+    WsMessage *m = g_new0(WsMessage, 1);
+    m->from_server = TRUE;
+    m->ms     = 5;
+    m->opcode = WS_TEXT;
+    m->data   = g_bytes_new_static("caf\xc3\xa9 \"q\"", 9);
+    g_ptr_array_add(messages, m);
+    m = g_new0(WsMessage, 1);
+    m->ms     = 7;
+    m->opcode = WS_BINARY;
+    m->data   = g_bytes_new_static("\x00\x01\xff", 3);
+    g_ptr_array_add(messages, m);
+    GBytes *record = ws_messages_write("https://example.org/ws", messages);
+    b = g_bytes_get_data(record, &n);
+    GPtrArray *back = ws_messages_read(b, n);
+    g_assert_nonnull(back);
+    g_assert_cmpuint(back->len, ==, 2);
+    WsMessage *m0 = g_ptr_array_index(back, 0), *m1 = g_ptr_array_index(back, 1);
+    g_assert_true(m0->from_server && !m1->from_server);
+    g_assert_cmpint(m0->ms, ==, 5);
+    g_assert_true(g_bytes_equal(m0->data, ((WsMessage *)g_ptr_array_index(messages, 0))->data));
+    g_assert_cmpuint(m1->opcode, ==, WS_BINARY);
+    g_assert_true(g_bytes_equal(m1->data, ((WsMessage *)g_ptr_array_index(messages, 1))->data));
+    g_ptr_array_unref(back);
+    g_assert_null(ws_messages_read((const guint8 *)"{\"format\": \"other\"}\n", 20));
+    g_bytes_unref(record);
+    g_ptr_array_unref(messages);
+    g_ptr_array_unref(h.opcodes);
+    g_ptr_array_unref(h.payloads);
 }
 
 int main(int argc, char *argv[])
@@ -1317,6 +1504,7 @@ int main(int argc, char *argv[])
     g_test_add_func("/archive/proxy/records-as-received", test_proxy_records_as_received);
     g_test_add_func("/archive/surt", test_surt);
     g_test_add_func("/archive/replay", test_replay);
+    g_test_add_func("/archive/websocket", test_websocket);
     g_test_add_func("/archive/request-key", test_request_key);
     g_test_add_func("/archive/index", test_index);
     g_test_add_func("/archive/zip", test_zip);

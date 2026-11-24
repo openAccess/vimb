@@ -19,7 +19,11 @@ vimb.so: $(OBJ) $(ARCHIVE_LIB)
 	$(Q)$(CC) -shared $(OBJ) $(ARCHIVE_LIB) $(LDFLAGS) -o $@
 
 # The archiving module builds with its own flags (see archive/Makefile).
+# Built by the archive's own make, which knows when the library is out of
+# date. The empty recipe has make look at the library again afterwards, so
+# that vimb is linked again when it changed.
 $(ARCHIVE_LIB): archive-lib
+	@:
 archive-lib:
 	$(Q)$(MAKE) -C archive libvimbarchive.a
 

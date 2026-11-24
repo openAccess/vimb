@@ -20,7 +20,26 @@
 #include "recorder.h"
 #include "warc.h"
 
+/* Payloads smaller than this aren't worth a revisit, whose head is as big. */
+#define REVISIT_MIN 512
+
+/* Where a payload was first recorded. */
+typedef struct {
+    char *id;
+    char *uri;
+    char *date;
+} Original;
+
+static void original_free(Original *o)
+{
+    g_free(o->id);
+    g_free(o->uri);
+    g_free(o->date);
+    g_free(o);
+}
+
 struct ArchiveRecorder {
+    GHashTable  *originals;     /* payload digest -> Original; the writer's thread's */
     WarcWriter  *writer;
     GThread     *thread;
     GAsyncQueue *queue;
@@ -49,13 +68,82 @@ void archive_exchange_free(ArchiveExchange *exchange)
     spool_free(exchange->response);
     g_free(exchange->payload_digest);
     g_free(exchange->truncated);
+    g_free(exchange->record_type);
+    g_free(exchange->content_type);
     g_free(exchange);
+}
+
+typedef struct {
+    Spool   *head;
+    guint64 left;
+} HeadCopy;
+
+static gboolean copy_head(const guint8 *data, gsize len, gpointer user_data, GError **error)
+{
+    HeadCopy *copy = user_data;
+    gsize n = (gsize)MIN((guint64)len, copy->left);
+    if (n && !spool_append(copy->head, data, n, error)) {
+        return FALSE;
+    }
+    copy->left -= n;
+    return copy->left > 0;          /* stopped, once it has it all */
+}
+
+/* The response's head alone, as a revisit holds it; NULL if it can't be had. */
+static Spool *head_of(ArchiveExchange *exchange)
+{
+    HeadCopy copy = {spool_new(g_get_tmp_dir(), (gsize)exchange->head_length + 1),
+        exchange->head_length};
+    spool_foreach(exchange->response, copy_head, &copy, NULL);
+    if (copy.left) {
+        spool_free(copy.head);
+        return NULL;
+    }
+    return copy.head;
+}
+
+static gboolean dedupable(const ArchiveExchange *exchange)
+{
+    return exchange->payload_digest && !exchange->truncated && exchange->head_length
+        && exchange->payload_length >= REVISIT_MIN;
+}
+
+/* A record of its own, not an exchange. */
+static void write_record(ArchiveRecorder *recorder, ArchiveExchange *exchange)
+{
+    GError *error = NULL;
+    WarcRecordInfo info = {
+        .type         = exchange->record_type,
+        .target_uri   = exchange->target_uri,
+        .content_type = exchange->content_type,
+        .date         = exchange->date,
+    };
+    if (warc_writer_write(recorder->writer, &info, exchange->response, NULL, NULL, NULL,
+                &error)) {
+        g_atomic_int_inc(&recorder->count);
+    } else {
+        g_warning("archive: could not record %s: %s", exchange->target_uri, error->message);
+        g_mutex_lock(&recorder->lock);
+        if (!recorder->error) {
+            recorder->error = error;
+            error = NULL;
+        }
+        g_mutex_unlock(&recorder->lock);
+        g_clear_error(&error);
+    }
 }
 
 static void write_exchange(ArchiveRecorder *recorder, ArchiveExchange *exchange)
 {
     GError *error   = NULL;
     char *response_id = NULL;
+    if (exchange->record_type) {
+        write_record(recorder, exchange);
+        return;
+    }
+    Original *original = dedupable(exchange)
+        ? g_hash_table_lookup(recorder->originals, exchange->payload_digest) : NULL;
+    Spool *head = original ? head_of(exchange) : NULL;
 
     WarcRecordInfo response = {
         .type           = "response",
@@ -74,8 +162,23 @@ static void write_exchange(ArchiveRecorder *recorder, ArchiveExchange *exchange)
         .date         = exchange->date,
     };
 
-    if (warc_writer_write(recorder->writer, &response, exchange->response,
+    if (head) {
+        response.type           = "revisit";
+        response.profile        = WARC_PROFILE_IDENTICAL;
+        response.refers_to      = original->id;
+        response.refers_to_uri  = original->uri;
+        response.refers_to_date = original->date;
+    }
+    if (warc_writer_write(recorder->writer, &response, head ? head : exchange->response,
                 &response_id, NULL, NULL, &error)) {
+        if (!head && dedupable(exchange)
+                && !g_hash_table_contains(recorder->originals, exchange->payload_digest)) {
+            Original *o = g_new0(Original, 1);
+            o->id   = g_strdup(response_id);
+            o->uri  = g_strdup(exchange->target_uri);
+            o->date = warc_format_date(exchange->date);
+            g_hash_table_insert(recorder->originals, g_strdup(exchange->payload_digest), o);
+        }
         request.concurrent_to = response_id;
         if (warc_writer_write(recorder->writer, &request, exchange->request,
                     NULL, NULL, NULL, &error)) {
@@ -93,6 +196,9 @@ static void write_exchange(ArchiveRecorder *recorder, ArchiveExchange *exchange)
         g_clear_error(&error);
     }
     g_free(response_id);
+    if (head) {
+        spool_free(head);
+    }
 }
 
 static gpointer run(gpointer data)
@@ -119,6 +225,8 @@ ArchiveRecorder *archive_recorder_start(const char *warc_path, const char *softw
     ArchiveRecorder *recorder = g_new0(ArchiveRecorder, 1);
     recorder->writer = writer;
     recorder->queue  = g_async_queue_new();
+    recorder->originals = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+            (GDestroyNotify)original_free);
     g_mutex_init(&recorder->lock);
     recorder->thread = g_thread_new("archive-writer", run, recorder);
     return recorder;
@@ -152,6 +260,7 @@ gboolean archive_recorder_finish(ArchiveRecorder *recorder, guint *written, GErr
         g_propagate_error(error, close_error);
     }
     g_async_queue_unref(recorder->queue);
+    g_hash_table_unref(recorder->originals);
     g_mutex_clear(&recorder->lock);
     g_free(recorder);
     return ok;

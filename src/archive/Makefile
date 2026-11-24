@@ -19,7 +19,7 @@ override CPPFLAGS += -D_POSIX_C_SOURCE=200809L -DG_LOG_DOMAIN=\"archive\"
 LDLIBS             = $(shell $(PKG_CONFIG) --libs $(ARCHIVE_LIBS))
 
 SRC = spool.c http1.c ca.c warc.c recorder.c netcheck.c proxy.c \
-      json.c surt.c request_key.c indexer.c zip.c wacz.c replay.c
+      json.c surt.c request_key.c indexer.c zip.c wacz.c replay.c websocket.c
 OBJ = $(SRC:.c=.o)
 
 all: libvimbarchive.a vimb-archive-proxy vimb-archive-pack

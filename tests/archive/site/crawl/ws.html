@@ -1,0 +1,21 @@
+<!doctype html><meta charset=utf-8><title>Websocket</title>
+<p>A conversation over a websocket:</p>
+<ol id=log></ol>
+<script>
+const log = (t) => {
+  const li = document.createElement('li');
+  li.textContent = t;
+  document.getElementById('log').appendChild(li);
+};
+const port = new URLSearchParams(location.search).get('port') || '9444';
+const ws = new WebSocket('ws://127.0.0.1:' + port + '/echo', ['vimb-test']);
+ws.onopen = () => log('open ' + ws.protocol);
+ws.onmessage = (e) => {
+  log('got ' + e.data);
+  if (e.data === 'hello') ws.send('one');
+  else if (e.data === 'echo one') ws.send('two');
+  else if (e.data === 'echo two') { log('done'); document.title = 'Websocket done'; }
+};
+ws.onclose = () => log('closed');
+ws.onerror = () => log('error');
+</script>

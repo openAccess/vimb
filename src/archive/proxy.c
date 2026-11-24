@@ -23,6 +23,7 @@
 #include "http1.h"
 #include "netcheck.h"
 #include "proxy.h"
+#include "websocket.h"
 #include "recorder.h"
 #include "spool.h"
 #include "warc.h"
@@ -53,6 +54,7 @@ struct ArchiveProxy {
     gpointer              allow_data;
     GMainContext          *owner_context;
     ArchiveReplay         *replay;          /* answers everything, in replay */
+    GPtrArray             *websockets;      /* under lock: the WsRecordings open */
 
     ArchiveCa             *ca;
     ArchiveRecorder       *recorder;        /* under lock; NULL once finished */
@@ -244,6 +246,13 @@ static gboolean resolve_destination(const char *target, const Destination *tunne
     const char *scheme = g_uri_get_scheme(uri);
     const char *host   = g_uri_get_host(uri);
     gboolean ok = TRUE;
+    /* A websocket comes as ws: (or wss:), and is the http(s) request it
+     * upgrades -- and archived and replayed as that. */
+    if (!g_ascii_strcasecmp(scheme, "ws")) {
+        scheme = "http";
+    } else if (!g_ascii_strcasecmp(scheme, "wss")) {
+        scheme = "https";
+    }
     if (g_ascii_strcasecmp(scheme, "http") && g_ascii_strcasecmp(scheme, "https")) {
         g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
                 "Only http and https are proxied, not %s.", scheme);
@@ -555,13 +564,72 @@ static gboolean connect_upstream(Conn *conn, const Destination *dest, guint *sta
 
 /* ----------------------------------------------------------------------- */
 /* Websockets and other upgrades: once switched, bytes are passed both ways
- * until either side stops. Only the handshake is archived. */
+ * until either side stops. A websocket's messages are archived too, when it
+ * is recorded: read from the frames as they pass, each with its direction
+ * and time, and written, once it closes, as a record of their own (see
+ * websocket.h), which replay answers the websocket from. */
+
+typedef struct {
+    GMutex    lock;             /* for what follows */
+    GPtrArray *messages;        /* of WsMessage */
+    gint64    opened;           /* monotonic, µs */
+    GDateTime *opened_at;
+    char      *uri;
+    gboolean  written;          /* handed to the recorder: nothing more is kept */
+} WsRecording;
+
+/* The record of a websocket's messages so far, once: NULL if they were
+ * written already, or there are none. */
+static ArchiveExchange *ws_recording_take(ArchiveProxy *proxy, WsRecording *rec)
+{
+    ArchiveExchange *exchange = NULL;
+    g_mutex_lock(&rec->lock);
+    if (!rec->written && rec->messages->len) {
+        exchange = archive_exchange_new();
+        exchange->record_type  = g_strdup("resource");
+        exchange->content_type = g_strdup(ARCHIVE_WEBSOCKET_MIME);
+        exchange->target_uri   = g_strdup(rec->uri);
+        exchange->date         = g_date_time_ref(rec->opened_at);
+        exchange->response     = spool_new(proxy->tmp_dir, SPOOL_MEMORY);
+        GBytes *block = ws_messages_write(rec->uri, rec->messages);
+        gsize size;
+        const guint8 *data = g_bytes_get_data(block, &size);
+        spool_append(exchange->response, data, size, NULL);
+        g_bytes_unref(block);
+        rec->written = TRUE;
+    }
+    g_mutex_unlock(&rec->lock);
+    return exchange;
+}
 
 typedef struct {
     GInputStream  *in;
     GOutputStream *out;
     GCancellable  *cancellable;
+    WsReader      *reader;      /* when recorded */
+    WsRecording   *recording;
+    gboolean      from_server;
 } Pipe;
+
+static void on_ws_message(guint opcode, const guint8 *data, gsize len, gpointer user_data)
+{
+    Pipe *pipe = user_data;
+    if (opcode != WS_TEXT && opcode != WS_BINARY && opcode != WS_CLOSE) {
+        return;                     /* pings and pongs, the connection's own */
+    }
+    WsMessage *m   = g_new0(WsMessage, 1);
+    m->from_server = pipe->from_server;
+    m->opcode      = opcode;
+    m->data        = g_bytes_new(data, len);
+    g_mutex_lock(&pipe->recording->lock);
+    m->ms = (g_get_monotonic_time() - pipe->recording->opened) / 1000;
+    if (pipe->recording->written) {
+        ws_message_free(m);         /* the archive was finished meanwhile */
+    } else {
+        g_ptr_array_add(pipe->recording->messages, m);
+    }
+    g_mutex_unlock(&pipe->recording->lock);
+}
 
 static gpointer pipe_run(gpointer data)
 {
@@ -573,47 +641,105 @@ static gpointer pipe_run(gpointer data)
                     pipe->cancellable, NULL)) {
             break;
         }
+        if (pipe->reader) {
+            ws_reader_feed(pipe->reader, buf, (gsize)n);
+        }
     }
     g_free(buf);
     g_cancellable_cancel(pipe->cancellable);
     return NULL;
 }
 
-static void splice_upgraded(Conn *conn)
+static void splice_both(Conn *conn, Pipe *down, Pipe *up);
+
+/* Splices the browser and the site; with record_uri, a websocket's, records
+ * its messages under that URI. */
+static void splice_upgraded(Conn *conn, const char *record_uri)
 {
-    /* Whatever either side sent after the handshake is already buffered. */
-    if (conn->up_reader.start < conn->up_reader.end
-            && !write_out(conn->stream, conn->up_reader.buf + conn->up_reader.start,
-                conn->up_reader.end - conn->up_reader.start, conn->cancellable, NULL)) {
-        return;
+    WsRecording recording = {.messages = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)ws_message_free), .opened = g_get_monotonic_time(),
+        .opened_at = g_date_time_new_now_utc(), .uri = g_strdup(record_uri)};
+    g_mutex_init(&recording.lock);
+    Pipe down = {g_io_stream_get_input_stream(conn->up),
+        g_io_stream_get_output_stream(conn->stream), conn->cancellable, NULL, &recording, TRUE};
+    Pipe up   = {g_io_stream_get_input_stream(conn->stream),
+        g_io_stream_get_output_stream(conn->up), conn->cancellable, NULL, &recording, FALSE};
+    if (record_uri) {
+        down.reader = ws_reader_new(on_ws_message, &down);
+        up.reader   = ws_reader_new(on_ws_message, &up);
+        /* an archive finished while the websocket is open keeps what it
+         * carried so far (see archive_proxy_finish_recording()) */
+        g_mutex_lock(&conn->proxy->lock);
+        g_ptr_array_add(conn->proxy->websockets, &recording);
+        g_mutex_unlock(&conn->proxy->lock);
     }
-    if (conn->reader.start < conn->reader.end
-            && !write_out(conn->up, conn->reader.buf + conn->reader.start,
-                conn->reader.end - conn->reader.start, conn->cancellable, NULL)) {
-        return;
+
+    /* Whatever either side sent after the handshake is already buffered. */
+    gboolean ok = TRUE;
+    if (conn->up_reader.start < conn->up_reader.end) {
+        const guint8 *b = conn->up_reader.buf + conn->up_reader.start;
+        gsize n = conn->up_reader.end - conn->up_reader.start;
+        ok = write_out(conn->stream, b, n, conn->cancellable, NULL);
+        if (ok && down.reader) {
+            ws_reader_feed(down.reader, b, n);
+        }
+    }
+    if (ok && conn->reader.start < conn->reader.end) {
+        const guint8 *b = conn->reader.buf + conn->reader.start;
+        gsize n = conn->reader.end - conn->reader.start;
+        ok = write_out(conn->up, b, n, conn->cancellable, NULL);
+        if (ok && up.reader) {
+            ws_reader_feed(up.reader, b, n);
+        }
     }
     conn->up_reader.start = conn->up_reader.end = 0;
     conn->reader.start    = conn->reader.end = 0;
+    if (ok) {
+        splice_both(conn, &down, &up);
+    }
 
+    if (record_uri) {
+        g_mutex_lock(&conn->proxy->lock);
+        g_ptr_array_remove_fast(conn->proxy->websockets, &recording);
+        g_mutex_unlock(&conn->proxy->lock);
+        ArchiveExchange *exchange = ws_recording_take(conn->proxy, &recording);
+        if (exchange) {
+            proxy_submit(conn->proxy, exchange);
+        }
+    }
+    ws_reader_free(down.reader);
+    ws_reader_free(up.reader);
+    g_ptr_array_unref(recording.messages);
+    g_mutex_clear(&recording.lock);
+    g_date_time_unref(recording.opened_at);
+    g_free(recording.uri);
+}
+
+static void splice_both(Conn *conn, Pipe *down, Pipe *up)
+{
     /* A websocket may sit quiet for longer than a request would. */
     g_socket_set_timeout(g_socket_connection_get_socket(conn->client), 0);
     g_socket_set_timeout(g_socket_connection_get_socket(conn->up_socket), 0);
 
-    Pipe down = {g_io_stream_get_input_stream(conn->up),
-        g_io_stream_get_output_stream(conn->stream), conn->cancellable};
-    Pipe up   = {g_io_stream_get_input_stream(conn->stream),
-        g_io_stream_get_output_stream(conn->up), conn->cancellable};
-    GThread *thread = g_thread_new("archive-upgraded", pipe_run, &down);
-    pipe_run(&up);
+    GThread *thread = g_thread_new("archive-upgraded", pipe_run, down);
+    pipe_run(up);
     g_thread_join(thread);
 }
 
 /* ----------------------------------------------------------------------- */
 /* One request and its response. */
 
+/* What a response's payload comes to: its digest and length. */
+typedef struct {
+    GChecksum *sha1;
+    guint64   length;
+} Payload;
+
 static void on_payload(const guint8 *data, gsize len, gpointer user_data)
 {
-    g_checksum_update(user_data, data, (gssize)len);
+    Payload *payload = user_data;
+    g_checksum_update(payload->sha1, data, (gssize)len);
+    payload->length += len;
 }
 
 static void on_raw_body(const guint8 *data, gsize len, gpointer user_data)
@@ -689,8 +815,11 @@ static GString *upstream_head(const Http1Parser *request, const char *target)
             head->minor_version);
     for (guint i = 0; i < head->headers->len; i++) {
         Http1Header *h = &g_array_index(head->headers, Http1Header, i);
+        /* No permessage-deflate: a websocket's frames are archived as
+         * they're read, and compressed ones would need inflating first. */
         if (!g_ascii_strncasecmp(h->name, "Proxy-", 6)
-                || (drop_expect && !g_ascii_strcasecmp(h->name, "Expect"))) {
+                || (drop_expect && !g_ascii_strcasecmp(h->name, "Expect"))
+                || !g_ascii_strcasecmp(h->name, "Sec-WebSocket-Extensions")) {
             continue;
         }
         g_string_append_printf(out, "%s: %s\r\n", h->name, h->value);
@@ -713,7 +842,7 @@ static RelayResult relay_response(Conn *conn, const char *method, gboolean upgra
 {
     ArchiveProxy *proxy = conn->proxy;
     Http1Parser *parser = http1_parser_new(HTTP1_RESPONSE, MAX_HEAD);
-    GChecksum *sha1     = g_checksum_new(G_CHECKSUM_SHA1);
+    Payload payload     = {g_checksum_new(G_CHECKSUM_SHA1), 0};
     Spool *spool        = exchange ? spool_new(proxy->tmp_dir, SPOOL_MEMORY) : NULL;
     gboolean spooling   = exchange != NULL;
     gboolean client_ok  = TRUE;
@@ -724,7 +853,7 @@ static RelayResult relay_response(Conn *conn, const char *method, gboolean upgra
     *keep      = FALSE;
     *submitted = FALSE;
     http1_parser_set_request_method(parser, method);
-    http1_parser_set_payload_func(parser, on_payload, sha1);
+    http1_parser_set_payload_func(parser, on_payload, &payload);
 
     for (;;) {
         gssize n = reader_fill(&conn->up_reader, conn->cancellable, &error);
@@ -785,7 +914,8 @@ static RelayResult relay_response(Conn *conn, const char *method, gboolean upgra
             if (status / 100 == 1 && status != 101) {
                 /* 100 Continue, 103 Early Hints: passed on, not archived. */
                 http1_parser_reset(parser);
-                g_checksum_reset(sha1);
+                g_checksum_reset(payload.sha1);
+                payload.length = 0;
                 if (spool) {
                     spool_free(spool);
                     spool    = spool_new(proxy->tmp_dir, SPOOL_MEMORY);
@@ -803,20 +933,29 @@ static RelayResult relay_response(Conn *conn, const char *method, gboolean upgra
     if (exchange && http1_parser_has_head(parser)) {
         guint8 digest[20];
         gsize digest_len = sizeof(digest);
-        g_checksum_get_digest(sha1, digest, &digest_len);
+        g_checksum_get_digest(payload.sha1, digest, &digest_len);
         exchange->payload_digest = warc_label_sha1(digest);
+        exchange->payload_length = payload.length;
+        exchange->head_length    = http1_parser_raw_head(parser)->len;
         exchange->response       = spool;
         spool = NULL;
     }
     if (switched) {
-        /* The handshake is recorded now; the websocket may stay open long. */
+        /* The handshake is recorded now; the websocket may stay open long,
+         * and its messages are recorded when it closes. */
+        char *record_uri = NULL;
         if (exchange && exchange->response) {
+            const char *upgrade_to = http1_head_get(http1_parser_head(parser), "Upgrade");
+            if (upgrade_to && !g_ascii_strcasecmp(upgrade_to, "websocket")) {
+                record_uri = g_strdup(exchange->target_uri);
+            }
             proxy_submit(proxy, exchange);
             *submitted = TRUE;
         }
         if (client_ok) {
-            splice_upgraded(conn);
+            splice_upgraded(conn, record_uri);
         }
+        g_free(record_uri);
     } else {
         *keep = client_ok && done && http1_parser_keep_alive(parser);
     }
@@ -827,7 +966,7 @@ out:
         drop_upstream(conn);
     }
     spool_free(spool);
-    g_checksum_free(sha1);
+    g_checksum_free(payload.sha1);
     http1_parser_free(parser);
     g_clear_error(&error);
     return result;
@@ -835,6 +974,175 @@ out:
 
 /* Passes one request from the browser to its site and the answer back.
  * Returns whether the browser's connection may carry another request. */
+/* ---- a websocket, replayed ---- */
+
+#define WS_PAUSE_MAX_MS 1000    /* the longest pause between messages replayed */
+
+typedef struct {
+    gboolean eof;
+    guint    opcode;
+    GBytes   *data;
+} WsEvent;
+
+typedef struct {
+    Conn        *conn;
+    GAsyncQueue *events;
+} WsListener;
+
+static void on_client_frame(guint opcode, const guint8 *data, gsize len, gpointer user_data)
+{
+    WsEvent *e = g_new0(WsEvent, 1);
+    e->opcode  = opcode;
+    e->data    = g_bytes_new(data, len);
+    g_async_queue_push(((WsListener *)user_data)->events, e);
+}
+
+/* Reads what the page sends, a message at a time, into events. */
+static gpointer listen_run(gpointer data)
+{
+    WsListener *l = data;
+    WsReader *reader = ws_reader_new(on_client_frame, l);
+    guint8 *buf = g_malloc(BUF_SIZE);
+    for (;;) {
+        gssize n = g_input_stream_read(g_io_stream_get_input_stream(l->conn->stream), buf,
+                BUF_SIZE, l->conn->cancellable, NULL);
+        if (n <= 0 || !ws_reader_feed(reader, buf, (gsize)n)) {
+            break;
+        }
+    }
+    g_free(buf);
+    ws_reader_free(reader);
+    WsEvent *eof = g_new0(WsEvent, 1);
+    eof->eof = TRUE;
+    g_async_queue_push(l->events, eof);
+    return NULL;
+}
+
+static gboolean send_frame(Conn *conn, guint opcode, GBytes *data)
+{
+    gsize len;
+    const guint8 *payload = data ? g_bytes_get_data(data, &len) : NULL;
+    GBytes *frame = ws_frame(opcode, payload, payload ? len : 0, NULL);
+    gsize size;
+    const guint8 *bytes = g_bytes_get_data(frame, &size);
+    gboolean ok = write_out(conn->stream, bytes, size, conn->cancellable, NULL);
+    g_bytes_unref(frame);
+    return ok;
+}
+
+static void ws_event_free(WsEvent *e)
+{
+    if (e) {
+        if (e->data) {
+            g_bytes_unref(e->data);
+        }
+        g_free(e);
+    }
+}
+
+/* Waits up to ms (-1: for ever) for what the page does next: a message,
+ * which is counted; a ping, answered; a close, answered and the end. FALSE
+ * once the page has gone. */
+static gboolean wait_for_page(Conn *conn, GAsyncQueue *events, gint64 ms, guint *messages)
+{
+    gint64 until = ms < 0 ? -1 : g_get_monotonic_time() + ms * 1000;
+    for (;;) {
+        gint64 left = until < 0 ? -1 : until - g_get_monotonic_time();
+        if (until >= 0 && left <= 0) {
+            return TRUE;
+        }
+        WsEvent *e = left < 0 ? g_async_queue_pop(events)
+            : g_async_queue_timeout_pop(events, (guint64)left);
+        if (!e) {
+            return TRUE;                /* the time has come */
+        }
+        gboolean go_on = TRUE;
+        if (e->eof) {
+            go_on = FALSE;
+        } else if (e->opcode == WS_PING) {
+            go_on = send_frame(conn, WS_PONG, e->data);
+        } else if (e->opcode == WS_CLOSE) {
+            send_frame(conn, WS_CLOSE, e->data);
+            go_on = FALSE;
+        } else if (e->opcode == WS_TEXT || e->opcode == WS_BINARY) {
+            (*messages)++;
+            if (until < 0) {
+                ws_event_free(e);
+                return TRUE;            /* the message waited for */
+            }
+        }
+        ws_event_free(e);
+        if (!go_on) {
+            return FALSE;
+        }
+    }
+}
+
+/* Plays a websocket's messages back: the site's, each once as many of the
+ * page's have come as had come before it in the capture, and after the pause
+ * it came after (a second at most); then whatever the page sends is only
+ * listened to, until it goes. */
+static void replay_websocket(Conn *conn, GPtrArray *messages)
+{
+    WsListener listener = {conn, g_async_queue_new_full((GDestroyNotify)ws_event_free)};
+    g_socket_set_timeout(g_socket_connection_get_socket(conn->client), 0);
+    GThread *thread = g_thread_new("archive-replay-ws", listen_run, &listener);
+
+    guint heard = 0, expected = 0;
+    gint64 last_ms = 0;
+    gboolean open = TRUE;
+    for (guint i = 0; i < messages->len && open; i++) {
+        WsMessage *m = g_ptr_array_index(messages, i);
+        if (!m->from_server) {
+            expected++;
+            while (open && heard < expected) {
+                open = wait_for_page(conn, listener.events, -1, &heard);
+            }
+            last_ms = m->ms;
+            continue;
+        }
+        gint64 pause = CLAMP(m->ms - last_ms, 0, WS_PAUSE_MAX_MS);
+        open = wait_for_page(conn, listener.events, pause, &heard)
+            && send_frame(conn, m->opcode, m->data);
+        last_ms = m->ms;
+        if (m->opcode == WS_CLOSE) {
+            open = FALSE;
+        }
+    }
+    while (open) {
+        open = wait_for_page(conn, listener.events, -1, &heard);
+    }
+    g_cancellable_cancel(conn->cancellable);    /* the listener's read */
+    g_thread_join(thread);
+    g_async_queue_unref(listener.events);
+}
+
+/* Answers a websocket's handshake from the archive, and plays it back. */
+static void replay_upgrade(Conn *conn, const ArchiveReplayRequest *asked)
+{
+    const char *key = http1_head_get(asked->head, "Sec-WebSocket-Key");
+    ArchiveReplayWebsocket *ws = key ? archive_replay_websocket(conn->proxy->replay, asked) : NULL;
+    if (!ws) {
+        send_error(conn, 404, "Not Found", "The archive holds no messages of this websocket.");
+        return;
+    }
+    char *accept = ws_accept(key);
+    GString *head = g_string_new(NULL);
+    g_string_append_printf(head, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n", accept);
+    if (ws->protocol && http1_head_get(asked->head, "Sec-WebSocket-Protocol")) {
+        g_string_append_printf(head, "Sec-WebSocket-Protocol: %s\r\n", ws->protocol);
+    }
+    g_string_append(head, "\r\n");
+    if (write_out(conn->stream, head->str, head->len, conn->cancellable, NULL)) {
+        g_debug("replay: websocket %s: %u messages", asked->url, ws->messages->len);
+        replay_websocket(conn, ws->messages);
+    }
+    g_string_free(head, TRUE);
+    g_free(accept);
+    archive_replay_websocket_free(ws);
+}
+
 /* Answers a request from the archive being replayed. */
 static gboolean replay_request(Conn *conn, Http1Parser *request, GByteArray *body,
         const Destination *dest)
@@ -847,6 +1155,12 @@ static gboolean replay_request(Conn *conn, Http1Parser *request, GByteArray *bod
         .body     = body->data,
         .body_len = body->len,
     };
+    const char *upgrade_to = http1_head_get(head, "Upgrade");
+    if (upgrade_to && !g_ascii_strcasecmp(upgrade_to, "websocket")
+            && http1_head_has_token(head, "Connection", "upgrade")) {
+        replay_upgrade(conn, &asked);
+        return FALSE;               /* the connection was the websocket's */
+    }
     gboolean found;
     GBytes *answer = archive_replay_answer(conn->proxy->replay, &asked, &found);
     gsize size;
@@ -1199,6 +1513,7 @@ static void proxy_free(ArchiveProxy *proxy)
     archive_ca_free(proxy->ca);
     g_clear_pointer(&proxy->hosts, g_hash_table_unref);
     g_clear_pointer(&proxy->connections, g_hash_table_unref);
+    g_clear_pointer(&proxy->websockets, g_ptr_array_unref);
     g_clear_pointer(&proxy->allow_sources, g_ptr_array_unref);
     g_clear_pointer(&proxy->loop, g_main_loop_unref);
     g_clear_pointer(&proxy->context, g_main_context_unref);
@@ -1233,6 +1548,7 @@ ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **e
             ? options->owner_context : g_main_context_default());
     proxy->hosts             = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     proxy->connections       = g_hash_table_new(g_direct_hash, g_direct_equal);
+    proxy->websockets        = g_ptr_array_new();
     proxy->allow_sources     = g_ptr_array_new();
     g_mutex_init(&proxy->lock);
     g_cond_init(&proxy->cond);
@@ -1304,6 +1620,13 @@ gboolean archive_proxy_finish_recording(ArchiveProxy *proxy, GError **error)
 {
     g_mutex_lock(&proxy->lock);
     ArchiveRecorder *recorder = proxy->recorder;
+    /* the websockets still open: what they carried so far */
+    for (guint i = 0; recorder && i < proxy->websockets->len; i++) {
+        ArchiveExchange *exchange = ws_recording_take(proxy, g_ptr_array_index(proxy->websockets, i));
+        if (exchange) {
+            archive_recorder_submit(recorder, exchange);
+        }
+    }
     proxy->recorder = NULL;
     g_mutex_unlock(&proxy->lock);
 

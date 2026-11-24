@@ -34,13 +34,23 @@ typedef struct {
     Spool     *response;        /* every byte of the response, as received */
     char      *payload_digest;  /* "sha1:..." of the body, coding removed */
     char      *truncated;       /* WARC-Truncated, when the response was cut */
+    guint64   head_length;      /* of the response's head, in response */
+    guint64   payload_length;   /* of its body, coding removed */
+    /* Not an exchange: a record of this type alone (a "resource" -- a
+     * websocket's messages), its block in response, of content_type. */
+    char      *record_type;
+    char      *content_type;
 } ArchiveExchange;
 
 ArchiveExchange *archive_exchange_new(void);
 void archive_exchange_free(ArchiveExchange *exchange);
 
 /* Writes exchanges to a WARC file from a thread of its own, in the order they
- * are handed in, as a response record and a request record each. */
+ * are handed in, as a response record and a request record each -- or, for a
+ * response whose payload an earlier one already holds, a revisit record in
+ * its place: the response's head, and where the payload is (WARC 1.1's
+ * identical-payload-digest profile). A browser fetches one file under many
+ * URLs, and a crawl the same files from page after page. */
 typedef struct ArchiveRecorder ArchiveRecorder;
 
 ArchiveRecorder *archive_recorder_start(const char *warc_path, const char *software,
