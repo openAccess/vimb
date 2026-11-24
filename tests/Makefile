@@ -13,7 +13,8 @@ TEST_PROGS = test-util \
 
 # The archiving module is built and tested on its own: it doesn't depend on
 # GTK or WebKit. webkit-check (not run here: it needs a display and the
-# network) loads pages through the proxy in a WebKit view.
+# network) loads pages through the proxy in a WebKit view; youtube-check.py
+# (nor this: it needs YouTube) archives YouTube videos and replays them.
 ARCHIVE_DIR   = ../$(SRCDIR)/archive
 ARCHIVE_LIB   = $(ARCHIVE_DIR)/libvimbarchive.a
 ARCHIVE_PKGS  = glib-2.0 gio-2.0 gnutls json-glib-1.0 zlib
