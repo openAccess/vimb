@@ -574,6 +574,8 @@ static gboolean ensure_backend(Client *c)
     A.policy.allow_archive_options = FALSE;
     A.policy.allowed_domains       = NULL;
     A.policy.url_check             = url_check;
+    /* the person's logins, only if they said the assistant may use them */
+    A.policy.allow_signins         = GET_BOOL(c, "assistant-signins");
     A.policy.learn                 = learn_value;
     /* scripts, if somebody can say yes to them, or said so beforehand */
     A.policy.approve_lua = !vb.scripted || vb.assistant_scripts ? approve_script : NULL;

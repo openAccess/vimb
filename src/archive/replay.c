@@ -47,6 +47,9 @@ typedef struct {
     guint64 length;
     guint   status;
     gint64  at;             /* ts, in seconds */
+    char    *request_body;      /* the body query an index records, cut */
+    char    *request_body_full; /* and whole, where that was cut */
+    char    **fields;           /* a body's: its fields, and its URL's query's; sorted */
 } Entry;
 
 struct ArchiveReplay {
@@ -57,6 +60,7 @@ struct ArchiveReplay {
     GMutex           lock;              /* for what follows */
     GHashTable       *moments;          /* URL -> when what answered it was captured */
     GHashTable       *origin_moments;   /* origin -> when its last page was */
+    GHashTable       *streams;          /* a stream's identity -> StreamPosition */
     gint64           last_page;         /* when the last page answered was; 0: none */
     guint            served;
     guint            missed;
@@ -165,6 +169,9 @@ static void entry_free(Entry *e)
     g_free(e->mime);
     g_free(e->digest);
     g_free(e->filename);
+    g_free(e->request_body);
+    g_free(e->request_body_full);
+    g_strfreev(e->fields);
     g_free(e);
 }
 
@@ -228,7 +235,9 @@ static char *json_string(const char **p)
 static void take_field(Entry *e, const char *name, char *value)
 {
     char **field = !strcmp(name, "url") ? &e->url : !strcmp(name, "mime") ? &e->mime
-        : !strcmp(name, "digest") ? &e->digest : !strcmp(name, "filename") ? &e->filename : NULL;
+        : !strcmp(name, "digest") ? &e->digest : !strcmp(name, "filename") ? &e->filename
+        : !strcmp(name, "requestBody") ? &e->request_body
+        : !strcmp(name, "requestBodyFull") ? &e->request_body_full : NULL;
     if (field) {
         g_free(*field);
         *field = value;
@@ -301,6 +310,51 @@ static gboolean read_flat_json(Entry *e)
     }
 }
 
+static int compare_strings(gconstpointer a, gconstpointer b)
+{
+    return strcmp(*(char * const *)a, *(char * const *)b);
+}
+
+/* A body's fields, and its URL's query's as "?name=value": sorted, once each. */
+static char **fields_of(const char *body_query, const char *url)
+{
+    GPtrArray *all = g_ptr_array_new_with_free_func(g_free);
+    char **body = archive_request_body_fields(body_query);
+    for (char **f = body; *f; f++) {
+        g_ptr_array_add(all, *f);
+    }
+    g_free(body);
+    const char *q = strchr(url, '?');
+    if (q) {
+        char *query = g_strndup(q + 1, strcspn(q + 1, "#"));
+        char **terms = g_strsplit(query, "&", -1);
+        for (char **t = terms; *t; t++) {
+            if (**t) {
+                g_ptr_array_add(all, g_strconcat("?", *t, NULL));
+            }
+        }
+        g_strfreev(terms);
+        g_free(query);
+    }
+    g_ptr_array_sort(all, compare_strings);
+    GPtrArray *unique = g_ptr_array_new();
+    for (guint i = 0; i < all->len; i++) {
+        char *f = g_ptr_array_index(all, i);
+        if (!unique->len || strcmp(g_ptr_array_index(unique, unique->len - 1), f)) {
+            g_ptr_array_add(unique, g_strdup(f));
+        }
+    }
+    g_ptr_array_unref(all);
+    g_ptr_array_add(unique, NULL);
+    return (char **)g_ptr_array_free(unique, FALSE);
+}
+
+static gboolean has_field(char **sorted, const char *field)
+{
+    guint n = g_strv_length(sorted);
+    return bsearch(&field, sorted, n, sizeof(char *), compare_strings) != NULL;
+}
+
 /* What a lookup needs of an entry, however its JSON is written. */
 static void read_entry_json(Entry *e)
 {
@@ -326,6 +380,9 @@ static void read_entry_json(Entry *e)
     e->mime     = e->mime ? e->mime : g_strdup("");
     e->filename = e->filename ? e->filename : g_strdup("");
     e->at = seconds_of(e->ts);
+    if (e->request_body_full || e->request_body) {
+        e->fields = fields_of(e->request_body_full ? e->request_body_full : e->request_body, e->url);
+    }
 }
 
 static gboolean load_index(ArchiveReplay *r, GError **error)
@@ -469,6 +526,7 @@ ArchiveReplay *archive_replay_open(const char *wacz_path, GError **error)
     r->pages   = g_ptr_array_new_with_free_func((GDestroyNotify)page_free);
     r->moments = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     r->origin_moments = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    r->streams = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     r->zip     = archive_zip_reader_open(wacz_path, error);
     if (!r->zip || !load_index(r, error)) {
         archive_replay_free(r);
@@ -491,6 +549,7 @@ void archive_replay_free(ArchiveReplay *r)
     g_ptr_array_unref(r->pages);
     g_hash_table_unref(r->moments);
     g_hash_table_unref(r->origin_moments);
+    g_hash_table_unref(r->streams);
     g_free(r->title);
     g_mutex_clear(&r->lock);
     g_free(r);
@@ -1067,6 +1126,303 @@ static const Entry *find_with_fewer_parameters(ArchiveReplay *r, const char *key
     return s.best;
 }
 
+/* ---- streams and bodies ---- */
+
+typedef struct {
+    guint  next;
+    gint64 last_count;
+} StreamPosition;
+
+typedef struct {
+    char *name;
+    char *value;
+} Param;
+
+static void param_free(Param *p)
+{
+    g_free(p->name);
+    g_free(p->value);
+    g_free(p);
+}
+
+static int compare_params(gconstpointer a, gconstpointer b)
+{
+    const Param *x = *(Param * const *)a, *y = *(Param * const *)b;
+    int c = strcmp(x->name, y->name);
+    return c ? c : strcmp(x->value, y->value);
+}
+
+/* A URL's query, as names and values, sorted. */
+static GPtrArray *params_of(const char *url)
+{
+    GPtrArray *params = g_ptr_array_new_with_free_func((GDestroyNotify)param_free);
+    const char *q = strchr(url, '?');
+    if (q) {
+        char *query = g_strndup(q + 1, strcspn(q + 1, "#"));
+        char **terms = g_strsplit(query, "&", -1);
+        for (char **t = terms; *t; t++) {
+            if (!**t) {
+                continue;
+            }
+            char *eq = strchr(*t, '=');
+            Param *p = g_new0(Param, 1);
+            p->name  = eq ? g_strndup(*t, eq - *t) : g_strdup(*t);
+            p->value = g_strdup(eq ? eq + 1 : "");
+            g_ptr_array_add(params, p);
+        }
+        g_strfreev(terms);
+        g_free(query);
+    }
+    g_ptr_array_sort(params, compare_params);
+    return params;
+}
+
+static const char *param_value(GPtrArray *params, const char *name, gboolean *present)
+{
+    for (guint i = 0; i < params->len; i++) {
+        Param *p = g_ptr_array_index(params, i);
+        if (!strcmp(p->name, name)) {
+            *present = TRUE;
+            return p->value;
+        }
+    }
+    *present = FALSE;
+    return NULL;
+}
+
+static gboolean is_count(const char *v)
+{
+    gsize n = strlen(v);
+    if (!n || n > 12) {
+        return FALSE;
+    }
+    for (const char *c = v; *c; c++) {
+        if (!g_ascii_isdigit(*c)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* Whether two queries, setting aside what each made up, are the same but
+ * for at most one parameter both give a count -- a request counted; *by is
+ * that parameter, NULL if they don't differ at all. */
+static gboolean counted_by(GPtrArray *asked, GPtrArray *captured, GHashTable *made_up,
+        const char **by)
+{
+    GPtrArray *a = g_ptr_array_new(), *b = g_ptr_array_new();
+    for (guint i = 0; i < asked->len; i++) {
+        Param *p = g_ptr_array_index(asked, i);
+        if (!g_hash_table_contains(made_up, p->name)) {
+            g_ptr_array_add(a, p);
+        }
+    }
+    for (guint i = 0; i < captured->len; i++) {
+        Param *p = g_ptr_array_index(captured, i);
+        if (!g_hash_table_contains(made_up, p->name)) {
+            g_ptr_array_add(b, p);
+        }
+    }
+    const char *counted = NULL;
+    gboolean ok = a->len == b->len;
+    for (guint i = 0; ok && i < a->len; i++) {
+        Param *x = g_ptr_array_index(a, i), *y = g_ptr_array_index(b, i);
+        if (!strcmp(x->name, y->name) && !strcmp(x->value, y->value)) {
+            continue;
+        }
+        ok = !strcmp(x->name, y->name) && !counted && is_count(x->value) && is_count(y->value);
+        counted = x->name;
+    }
+    g_ptr_array_unref(a);
+    g_ptr_array_unref(b);
+    *by = counted;
+    return ok;
+}
+
+static int compare_capture_order(gconstpointer a, gconstpointer b)
+{
+    const Entry *x = *(Entry * const *)a, *y = *(Entry * const *)b;
+    int c = strcmp(x->ts, y->ts);
+    if (!c) {
+        c = strcmp(x->filename, y->filename);
+    }
+    return c ? c : (x->offset < y->offset ? -1 : x->offset > y->offset);
+}
+
+/* Of the candidates, those of the stream the request is part of -- the same
+ * address but for a count, one request after another, as YouTube counts
+ * each ("rn") -- the next in the order the capture made them; NULL when it
+ * has had them all. *is_stream says whether there is such a stream. A
+ * stream asks for what follows what came before, in more fields than can be
+ * matched one by one; but a player given the same answers asks in the same
+ * order. */
+static const Entry *next_in_stream(ArchiveReplay *r, const char *url, const char *key,
+        GPtrArray *candidates, gboolean *is_stream)
+{
+    *is_stream = FALSE;
+    GPtrArray *asked = params_of(url);
+    GPtrArray *captured = g_ptr_array_new_with_free_func((GDestroyNotify)g_ptr_array_unref);
+    for (guint i = 0; i < candidates->len; i++) {
+        g_ptr_array_add(captured, params_of(((Entry *)g_ptr_array_index(candidates, i))->url));
+    }
+    /* what each player made up for itself: a parameter every capture has,
+     * none with the request's value -- YouTube's "cpn" */
+    GHashTable *made_up = g_hash_table_new(g_str_hash, g_str_equal);
+    for (guint i = 0; i < asked->len; i++) {
+        Param *p = g_ptr_array_index(asked, i);
+        gboolean everywhere = captured->len > 0, seen = FALSE;
+        for (guint j = 0; j < captured->len && everywhere; j++) {
+            gboolean present;
+            const char *v = param_value(g_ptr_array_index(captured, j), p->name, &present);
+            everywhere = present;
+            seen |= present && !strcmp(v, p->value);
+        }
+        if (everywhere && !seen && !is_count(p->value)) {
+            g_hash_table_add(made_up, p->name);
+        }
+    }
+    const char *counted = NULL;
+    GPtrArray *stream = g_ptr_array_new();
+    for (guint i = 0; i < candidates->len; i++) {
+        const char *by;
+        if (counted_by(asked, g_ptr_array_index(captured, i), made_up, &by)
+                && (!by || !counted || !strcmp(by, counted))) {
+            counted = by ? by : counted;
+            g_ptr_array_add(stream, g_ptr_array_index(candidates, i));
+        }
+    }
+    const Entry *next = NULL;
+    /* a count with one capture is no stream, nor are captures not counted */
+    if (stream->len >= 2 && counted) {
+        *is_stream = TRUE;
+        g_ptr_array_sort(stream, compare_capture_order);
+        /* named for the path and the address but its count */
+        GString *identity = g_string_new(NULL);
+        g_string_append_len(identity, key, strcspn(key, "?"));
+        gint64 count = -1;
+        for (guint i = 0; i < asked->len; i++) {
+            Param *p = g_ptr_array_index(asked, i);
+            if (!strcmp(p->name, counted)) {
+                count = (gint64)g_ascii_strtoll(p->value, NULL, 10);
+            } else if (!g_hash_table_contains(made_up, p->name)) {
+                g_string_append_printf(identity, "&%s=%s", p->name, p->value);
+            }
+        }
+        g_mutex_lock(&r->lock);
+        StreamPosition *pos = g_hash_table_lookup(r->streams, identity->str);
+        if (!pos) {
+            pos = g_new0(StreamPosition, 1);
+            pos->last_count = -1;
+            g_hash_table_insert(r->streams, g_strdup(identity->str), pos);
+        }
+        if (count <= pos->last_count) {
+            pos->next = 0;              /* counted from lower: a player begun again */
+        }
+        pos->last_count = count;
+        if (pos->next < stream->len) {
+            next = g_ptr_array_index(stream, pos->next++);
+        }
+        g_mutex_unlock(&r->lock);
+        g_string_free(identity, TRUE);
+    }
+    g_ptr_array_unref(stream);
+    g_hash_table_unref(made_up);
+    g_ptr_array_unref(captured);
+    g_ptr_array_unref(asked);
+    return next;
+}
+
+typedef struct {
+    char      *method;
+    GPtrArray *candidates;
+} BodyCandidates;
+
+static void visit_body_candidate(const Entry *e, const char *query, gpointer data)
+{
+    BodyCandidates *b = data;
+    char *method = key_method(query);
+    if (e->fields && e->status != 206 && strcmp(e->mime, ARCHIVE_WEBSOCKET_MIME)
+            && !strcmp(method, b->method)) {
+        g_ptr_array_add(b->candidates, (gpointer)e);
+    }
+    g_free(method);
+}
+
+/* For a POST or PUT: of the captures of key's path by its method, the one
+ * whose body -- and address -- agree most with the request's, field by field,
+ * a field counting the more the fewer captures share it; the nearest moment
+ * of those that agree as well; none, if none agrees in anything. What a page
+ * sends differs in more than what it asks for, so a request is seldom
+ * answered by its key alone: YouTube asks for its video by POSTing where its
+ * player is and what it has buffered. A stream (see next_in_stream()) is
+ * answered in its order. *settled is set when the answer, or that there is
+ * none, stands -- a stream has had all the capture had, or (but for
+ * only_if_cut) the bodies were weighed and none agreed -- so that nothing
+ * that matches by less is looked for. With only_if_cut, only for a body its
+ * key holds the start of (4096 characters): YouTube names the video asked
+ * for further on than that. */
+static const Entry *find_by_body(ArchiveReplay *r, const Asked *asked, const char *key,
+        const char *method, const char *content_type, const guint8 *body, gsize body_len,
+        gint64 moment, gboolean only_if_cut, gboolean *settled)
+{
+    *settled = FALSE;
+    if (!body || !body_len || (g_ascii_strcasecmp(method, "POST") && g_ascii_strcasecmp(method, "PUT"))) {
+        return NULL;
+    }
+    char *whole = archive_request_body_query(content_type, body, body_len, TRUE);
+    char *cut   = only_if_cut ? archive_request_body_query(content_type, body, body_len, FALSE)
+        : NULL;
+    gboolean go = whole && *whole && (!only_if_cut || strlen(whole) > strlen(cut ? cut : ""));
+    g_free(cut);
+    BodyCandidates b = {key_method(query_of(key)), g_ptr_array_new()};
+    if (go) {
+        each_capture_of_path(r, key, visit_body_candidate, &b);
+    }
+    const Entry *best = NULL;
+    if (b.candidates->len) {
+        gboolean is_stream;
+        best = next_in_stream(r, asked->url, key, b.candidates, &is_stream);
+        if (is_stream) {
+            *settled = best == NULL;
+        } else {
+            char **wanted = fields_of(whole, asked->url);
+            GHashTable *sharing = g_hash_table_new(g_str_hash, g_str_equal);
+            for (guint i = 0; i < b.candidates->len; i++) {
+                for (char **f = ((Entry *)g_ptr_array_index(b.candidates, i))->fields; *f; f++) {
+                    g_hash_table_insert(sharing, *f, GUINT_TO_POINTER(
+                                GPOINTER_TO_UINT(g_hash_table_lookup(sharing, *f)) + 1));
+                }
+            }
+            double best_score = 0;
+            gint64 best_far = 0;
+            for (guint i = 0; i < b.candidates->len; i++) {
+                const Entry *e = g_ptr_array_index(b.candidates, i);
+                double score = 0;
+                for (char **f = wanted; *f; f++) {
+                    if (has_field(e->fields, *f)) {
+                        score += 1.0 / GPOINTER_TO_UINT(g_hash_table_lookup(sharing, *f));
+                    }
+                }
+                gint64 far = distance(e, moment);
+                /* agreeing in nothing is no answer */
+                if (score > 0 && (!best || score > best_score
+                            || (score == best_score && far < best_far))) {
+                    best       = e;
+                    best_score = score;
+                    best_far   = far;
+                }
+            }
+            g_hash_table_unref(sharing);
+            g_strfreev(wanted);
+            *settled = !best && !only_if_cut;
+        }
+    }
+    g_ptr_array_unref(b.candidates);
+    g_free(b.method);
+    g_free(whole);
+    return best;
+}
+
 typedef const Entry *(*Finder)(ArchiveReplay *r, const char *key, gint64 moment, Accept accept,
         gconstpointer data, gboolean not_away);
 
@@ -1103,19 +1459,30 @@ static const Entry *lookup(ArchiveReplay *r, const Asked *asked, const char *met
     }
     static const Accept nearest_tiers[] = {whole_of_this_url, whole, any_of_this_url, any};
     static const Accept closest_tiers[] = {whole, any};
-    const Entry *e = NULL;
-    for (int k = 0; keys[k] && !e; k++) {
+    gboolean settled = FALSE;
+    /* a body the key holds only the start of: what agrees with all of it */
+    const Entry *e = keys[0] ? find_by_body(r, asked, keys[0], method, content_type, body,
+            body_len, moment, TRUE, &settled) : NULL;
+    for (int k = 0; keys[k] && !e && !settled; k++) {
         for (gsize t = 0; t < G_N_ELEMENTS(nearest_tiers) && !e; t++) {
             e = let_in_first(find_nearest, r, keys[k], moment, nearest_tiers[t], asked);
         }
     }
-    for (int k = 0; keys[k] && !e; k++) {
+    /* a POST or PUT whose body nothing was filed under: the one agreeing most */
+    if (!e && !settled && keys[0]) {
+        e = find_by_body(r, asked, keys[0], method, content_type, body, body_len, moment, FALSE,
+                &settled);
+    }
+    /* a stream that has had all the capture had answers nothing more -- not
+     * the last again, which a player would ask for again at once -- nor does
+     * a body agreeing with none, which would only be given another's answer */
+    for (int k = 0; keys[k] && !e && !settled; k++) {
         for (gsize t = 0; t < G_N_ELEMENTS(closest_tiers) && !e; t++) {
             e = let_in_first(asked->page ? find_ignoring_visit_values : find_closest, r, keys[k],
                     moment, closest_tiers[t], asked);
         }
     }
-    for (int k = 0; keys[k] && !e && asked->page; k++) {
+    for (int k = 0; keys[k] && !e && !settled && asked->page; k++) {
         e = find_with_fewer_parameters(r, keys[k], moment, a_page, asked);
     }
     g_free(keys[0]);

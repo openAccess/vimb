@@ -47,6 +47,7 @@ typedef enum {
     ARCHIVE_SAVING,     /* being packaged */
     ARCHIVE_DONE,       /* packaged, or failed to be; tabs may remain */
     ARCHIVE_REPLAYING,  /* not an archive being made: one being replayed */
+    ARCHIVE_SIGNIN,     /* nor that: the sign-ins, where the person signs in */
 } ArchiveState;
 
 struct Archive {
@@ -70,6 +71,7 @@ struct Archive {
     GSList               *waiters;      /* of SavedWaiter, told once it's saved */
     ArchiveReplay        *replay;       /* what is replayed, when it is */
     char                 *replay_path;
+    gboolean             signed_in;     /* started with the sign-ins' cookies */
 };
 
 typedef struct {
@@ -219,13 +221,15 @@ static void update_status(struct Archive *a)
         case ARCHIVE_SAVING:    label = "SAVING"; break;
         case ARCHIVE_DONE:      label = NULL;     break;
         case ARCHIVE_REPLAYING: label = "REPLAY"; break;
+        case ARCHIVE_SIGNIN:    label = "SIGN-IN"; break;
     }
     g_clear_pointer(&a->status, g_free);
     if (label) {
         gboolean long_name = g_utf8_strlen(a->name, -1) > STATUS_NAME_MAX;
         char *shown = long_name ? g_utf8_substring(a->name, 0, STATUS_NAME_MAX - 1)
             : g_strdup(a->name);
-        a->status = g_strdup_printf("[%s %s%s]", label, shown, long_name ? "…" : "");
+        a->status = g_strdup_printf("[%s %s%s%s]", label, shown, long_name ? "…" : "",
+                a->signed_in ? ", signed in" : "");
         g_free(shown);
     }
     for (Client *c = vb.clients; c; c = c->next) {
@@ -527,6 +531,234 @@ static void apply_cookie_policy(WebKitNetworkSession *session, const char *polic
 
 /* verify and allow_internal are -1 to follow the settings strict-ssl and
  * archive-allow-internal. */
+/* ---- sign-ins ----------------------------------------------------------- */
+
+/* Where the person signs in to sites for archiving: a profile of its own,
+ * kept on disk apart from their browsing. An archive started signed in
+ * begins with its cookies -- and nothing else of it, nor of the person's own
+ * profile. vimb never sees a password: the person signs in on the site. */
+static WebKitNetworkSession *signins;
+
+static WebKitNetworkSession *signin_session(void)
+{
+    if (!signins) {
+        char *data  = util_get_data_dir();
+        char *cache = util_get_cache_dir();
+        char *d     = g_build_filename(data, "archive-signins", NULL);
+        char *cd    = g_build_filename(cache, "archive-signins", NULL);
+        signins = webkit_network_session_new(d, cd);
+        vb_session_setup(signins);
+        g_free(cd);
+        g_free(d);
+        g_free(cache);
+        g_free(data);
+    }
+    return signins;
+}
+
+/* Waiting for WebKit's network process -- for a command that can't go on
+ * till it answers. Given up on, a wait frees itself when the answer comes. */
+typedef struct {
+    GMainLoop *loop;
+    GList     *cookies;
+    GError    *error;
+    gboolean  done;
+    gboolean  abandoned;
+} Wait;
+
+static void wait_free(Wait *w)
+{
+    g_list_free_full(w->cookies, (GDestroyNotify)soup_cookie_free);
+    g_clear_error(&w->error);
+    g_main_loop_unref(w->loop);
+    g_free(w);
+}
+
+static void wait_over(Wait *w)
+{
+    w->done = TRUE;
+    if (w->abandoned) {
+        wait_free(w);
+    } else {
+        g_main_loop_quit(w->loop);
+    }
+}
+
+static void got_cookies(GObject *source, GAsyncResult *res, gpointer data)
+{
+    Wait *w = data;
+    w->cookies = webkit_cookie_manager_get_all_cookies_finish(WEBKIT_COOKIE_MANAGER(source), res,
+            &w->error);
+    wait_over(w);
+}
+
+static void replaced_cookies(GObject *source, GAsyncResult *res, gpointer data)
+{
+    Wait *w = data;
+    webkit_cookie_manager_replace_cookies_finish(WEBKIT_COOKIE_MANAGER(source), res, &w->error);
+    wait_over(w);
+}
+
+static void cleared(GObject *source, GAsyncResult *res, gpointer data)
+{
+    Wait *w = data;
+    webkit_website_data_manager_clear_finish(WEBKIT_WEBSITE_DATA_MANAGER(source), res, &w->error);
+    wait_over(w);
+}
+
+static gboolean wait_too_long(gpointer data)
+{
+    g_main_loop_quit(((Wait *)data)->loop);
+    return G_SOURCE_REMOVE;
+}
+
+/* Runs the main loop till w is over; FALSE if it took too long. */
+static gboolean wait_for(Wait *w, GError **error)
+{
+    guint timeout = g_timeout_add_seconds(15, wait_too_long, w);
+    if (!w->done) {
+        g_main_loop_run(w->loop);
+    }
+    if (!w->done) {
+        w->abandoned = TRUE;
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                "WebKit took too long to answer");
+        return FALSE;
+    }
+    g_source_remove(timeout);
+    if (w->error) {
+        g_propagate_error(error, w->error);
+        w->error = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* The sign-ins' cookies: SoupCookies, the caller's. */
+static GList *signin_cookies(GError **error)
+{
+    Wait *w = g_new0(Wait, 1);
+    w->loop = g_main_loop_new(NULL, FALSE);
+    webkit_cookie_manager_get_all_cookies(webkit_network_session_get_cookie_manager(
+                signin_session()), NULL, got_cookies, w);
+    if (!wait_for(w, error)) {
+        if (!w->abandoned) {
+            wait_free(w);
+        }
+        return NULL;
+    }
+    GList *cookies = w->cookies;
+    w->cookies = NULL;
+    wait_free(w);
+    return cookies;
+}
+
+static gboolean give_cookies(WebKitNetworkSession *session, GList *cookies, GError **error)
+{
+    Wait *w = g_new0(Wait, 1);
+    w->loop = g_main_loop_new(NULL, FALSE);
+    webkit_cookie_manager_replace_cookies(webkit_network_session_get_cookie_manager(session),
+            cookies, NULL, replaced_cookies, w);
+    gboolean ok = wait_for(w, error);
+    if (!w->abandoned) {
+        wait_free(w);
+    }
+    return ok;
+}
+
+/* The sites signed in to, as their registrable domains: "example.co.uk". */
+static char *signin_sites(GList *cookies)
+{
+    GPtrArray *sites = g_ptr_array_new_with_free_func(g_free);
+    for (GList *l = cookies; l; l = l->next) {
+        const char *domain = soup_cookie_get_domain(l->data);
+        domain += domain && *domain == '.';
+        const char *base = domain ? soup_tld_get_base_domain(domain, NULL) : NULL;
+        const char *site = base ? base : domain;
+        gboolean have = !site;
+        for (guint i = 0; i < sites->len && !have; i++) {
+            have = !strcmp(g_ptr_array_index(sites, i), site);
+        }
+        if (!have) {
+            g_ptr_array_add(sites, g_strdup(site));
+        }
+    }
+    g_ptr_array_sort(sites, (GCompareFunc)g_strcmp0);
+    g_ptr_array_add(sites, NULL);
+    char *list = g_strjoinv(", ", (char **)sites->pdata);
+    g_ptr_array_free(sites, TRUE);
+    return list;
+}
+
+/* The sign-ins' tabs belong to this: not an archive, but the same plumbing. */
+static struct Archive *signin_tabs(void)
+{
+    for (GList *l = archives; l; l = l->next) {
+        struct Archive *a = l->data;
+        if (a->state == ARCHIVE_SIGNIN) {
+            return a;
+        }
+    }
+    struct Archive *a = g_new0(struct Archive, 1);
+    a->lock_fd = -1;
+    a->state   = ARCHIVE_SIGNIN;
+    a->name    = g_strdup("archiving");
+    a->session = g_object_ref(signin_session());
+    update_status(a);
+    archives = g_list_prepend(archives, a);
+    return a;
+}
+
+struct Archive *archiving_signins(void)
+{
+    return signin_tabs();
+}
+
+static VbCmdResult signin_command(Client *c, const char *word, const char *rest)
+{
+    GError *error = NULL;
+    if (!strcmp(word, "signin")) {
+        /* a tab to sign in in: at the page given, or this one */
+        const char *uri = *rest ? rest : c->state.uri;
+        Client *tab = vb_tab_new_archive(signin_tabs(),
+                uri && (g_str_has_prefix(uri, "http:") || g_str_has_prefix(uri, "https:"))
+                ? uri : "about:blank");
+        if (tab) {
+            vb_echo(tab, MSG_NORMAL, FALSE, "Sign in to sites here for archiving; :archive! archives signed in");
+        }
+        return CMD_SUCCESS;
+    }
+    if (!strcmp(rest, "clear")) {
+        Wait *w = g_new0(Wait, 1);
+        w->loop = g_main_loop_new(NULL, FALSE);
+        webkit_website_data_manager_clear(webkit_network_session_get_website_data_manager(
+                    signin_session()), WEBKIT_WEBSITE_DATA_ALL, 0, NULL, cleared, w);
+        gboolean ok = wait_for(w, &error);
+        if (!w->abandoned) {
+            wait_free(w);
+        }
+        if (!ok) {
+            vb_echo(c, MSG_ERROR, TRUE, "Could not clear the sign-ins: %s", error->message);
+            g_error_free(error);
+            return CMD_ERROR;
+        }
+        vb_echo(c, MSG_NORMAL, FALSE, "Archiving sign-ins cleared");
+        return CMD_SUCCESS;
+    }
+    GList *cookies = signin_cookies(&error);
+    if (error) {
+        vb_echo(c, MSG_ERROR, TRUE, "Could not read the sign-ins: %s", error->message);
+        g_error_free(error);
+        return CMD_ERROR;
+    }
+    char *sites = signin_sites(cookies);
+    vb_echo(c, MSG_NORMAL, FALSE, cookies ? "Signed in for archiving to: %s"
+            : "No sign-ins for archiving; :archive signin URL to sign in to a site%s", sites);
+    g_free(sites);
+    g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
+    return CMD_SUCCESS;
+}
+
 /* Starting from nothing: an ephemeral session, through the proxy. TLS
  * errors fail -- the proxy's certificates are accepted host by host, as it
  * hands them out, and nothing else is. */
@@ -547,9 +779,22 @@ static void make_session(struct Archive *a, Client *c)
 }
 
 static struct Archive *archive_start(Client *c, const char *name, int verify,
-        int allow_internal, GError **error)
+        int allow_internal, gboolean signed_in, GError **error)
 {
+    /* the sign-ins first, which can fail before anything is made */
+    GList *cookies = NULL;
+    if (signed_in) {
+        cookies = signin_cookies(error);
+        if (!cookies) {
+            if (error && !*error) {
+                g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                        "there are no sign-ins: sign in to a site with :archive signin URL first");
+            }
+            return NULL;
+        }
+    }
     struct Archive *a = g_new0(struct Archive, 1);
+    a->signed_in = signed_in;
     a->lock_fd = -1;
     a->state   = ARCHIVE_RECORDING;
     if (name && *name) {
@@ -597,6 +842,8 @@ static struct Archive *archive_start(Client *c, const char *name, int verify,
         .check_peer_user   = TRUE,
         .allow_certificate = on_allow_certificate,
         .allow_data        = a,
+        /* cookies and credentials aren't kept in an archive made signed in */
+        .redact_credentials = signed_in,
     };
     a->proxy = archive_proxy_start(&options, error);
     g_free(warc);
@@ -607,11 +854,16 @@ static struct Archive *archive_start(Client *c, const char *name, int verify,
     }
 
     make_session(a, c);
+    if (cookies && !give_cookies(a->session, cookies, error)) {
+        goto fail;
+    }
+    g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
     update_status(a);
     archives = g_list_prepend(archives, a);
     return a;
 
 fail:
+    g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
     if (a->pages) {
         fclose(a->pages);
         a->pages = NULL;
@@ -634,8 +886,8 @@ WebKitNetworkSession *archiving_session(struct Archive *archive)
 
 void archiving_tab_added(Client *c)
 {
-    if (c->archive->state == ARCHIVE_REPLAYING) {
-        c->archive->tabs++;         /* a replay lists no pages */
+    if (c->archive->state == ARCHIVE_REPLAYING || c->archive->state == ARCHIVE_SIGNIN) {
+        c->archive->tabs++;         /* neither lists pages */
         return;
     }
     if (!page_states) {
@@ -675,7 +927,8 @@ void archiving_tab_closed(Client *c)
      * goes, once it has. */
     if (a->state == ARCHIVE_RECORDING || a->state == ARCHIVE_PAUSED) {
         archive_stop(a);
-    } else if (a->state == ARCHIVE_DONE || a->state == ARCHIVE_REPLAYING) {
+    } else if (a->state == ARCHIVE_DONE || a->state == ARCHIVE_REPLAYING
+            || a->state == ARCHIVE_SIGNIN) {
         archive_free(a);
     }
 }
@@ -701,10 +954,10 @@ static struct Archive *target(Client *c)
     return only;
 }
 
-static VbCmdResult start(Client *c, const char *name)
+static VbCmdResult start(Client *c, const char *name, gboolean signed_in)
 {
     GError *error     = NULL;
-    struct Archive *a = archive_start(c, name, -1, -1, &error);
+    struct Archive *a = archive_start(c, name, -1, -1, signed_in, &error);
     if (!a) {
         vb_echo(c, MSG_ERROR, TRUE, "Could not start archiving: %s", error->message);
         g_error_free(error);
@@ -713,12 +966,13 @@ static VbCmdResult start(Client *c, const char *name)
     const char *uri = c->state.uri && *c->state.uri ? c->state.uri : GET_CHAR(c, "home-page");
     Client *tab     = vb_tab_new_archive(a, uri);
     if (tab) {
-        vb_echo(tab, MSG_NORMAL, FALSE, "Archiving as '%s'", a->name);
+        vb_echo(tab, MSG_NORMAL, FALSE, "Archiving as '%s'%s", a->name,
+                signed_in ? ", signed in" : "");
     }
     return CMD_SUCCESS;
 }
 
-VbCmdResult archiving_command(Client *c, const char *args)
+VbCmdResult archiving_command(Client *c, const char *args, gboolean bang)
 {
     char *text = g_strstrip(g_strdup(args ? args : ""));
     char *rest = text + strcspn(text, " \t");
@@ -728,7 +982,9 @@ VbCmdResult archiving_command(Client *c, const char *args)
     VbCmdResult result = CMD_SUCCESS;
 
     if (!*word || !strcmp(word, "start")) {
-        result = start(c, rest);
+        result = start(c, rest, bang);
+    } else if (!strcmp(word, "signin") || !strcmp(word, "signins")) {
+        result = signin_command(c, word, rest);
     } else if (!strcmp(word, "pause") || !strcmp(word, "resume") || !strcmp(word, "stop")
             || !strcmp(word, "name") || !strcmp(word, "status")) {
         struct Archive *a = target(c);
@@ -738,7 +994,7 @@ VbCmdResult archiving_command(Client *c, const char *args)
             result = CMD_ERROR;
         } else if (!strcmp(word, "status")) {
             static const char *states[] = {"recording", "paused", "being saved", "done",
-                "replaying"};
+                "replaying", "for signing in"};
             if (a->replay) {
                 guint served, missed;
                 archive_replay_counts(a->replay, &served, &missed);
@@ -749,8 +1005,8 @@ VbCmdResult archiving_command(Client *c, const char *args)
                         states[a->state], a->proxy ? archive_proxy_get_recorded(a->proxy) : 0,
                         a->saved ? ", saved as " : "", a->saved ? a->saved : "");
             }
-        } else if (a->state == ARCHIVE_REPLAYING) {
-            vb_echo(c, MSG_ERROR, TRUE, "'%s' is replayed, not recorded", a->name);
+        } else if (a->state == ARCHIVE_REPLAYING || a->state == ARCHIVE_SIGNIN) {
+            vb_echo(c, MSG_ERROR, TRUE, "'%s' isn't an archive being recorded", a->name);
             result = CMD_ERROR;
         } else if (a->state != ARCHIVE_RECORDING && a->state != ARCHIVE_PAUSED) {
             vb_echo(c, MSG_ERROR, TRUE, "'%s' is no longer recording", a->name);
@@ -767,7 +1023,7 @@ VbCmdResult archiving_command(Client *c, const char *args)
         }
     } else {
         /* :archive NAME */
-        result = start(c, text);
+        result = start(c, text, bang);
     }
     g_free(word);
     g_free(text);
@@ -954,9 +1210,9 @@ gboolean archiving_replay_counts(struct Archive *a, guint *served, guint *missed
 /* ---- for scripts ------------------------------------------------------- */
 
 struct Archive *archiving_create(Client *c, const char *name, int verify, int allow_internal,
-        GError **error)
+        gboolean signed_in, GError **error)
 {
-    return archive_start(c, name, verify, allow_internal, error);
+    return archive_start(c, name, verify, allow_internal, signed_in, error);
 }
 
 gboolean archiving_alive(struct Archive *a)
@@ -1032,7 +1288,8 @@ void archiving_rename(struct Archive *a, const char *name)
 
 const char *archiving_state(struct Archive *a)
 {
-    static const char *states[] = {"recording", "paused", "saving", "done", "replaying"};
+    static const char *states[] = {"recording", "paused", "saving", "done", "replaying",
+        "signing in"};
     return states[a->state];
 }
 

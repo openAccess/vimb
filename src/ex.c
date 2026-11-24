@@ -202,7 +202,7 @@ static ExInfo commands[] = {
     {"autocmd",          EX_AUTOCMD,     ex_autocmd,    EX_FLAG_CMD|EX_FLAG_BANG},
     {"augroup",          EX_AUGROUP,     ex_augroup,    EX_FLAG_LHS|EX_FLAG_BANG},
 #endif
-    {"archive",          EX_ARCHIVE,     ex_archive,    EX_FLAG_RHS},
+    {"archive",          EX_ARCHIVE,     ex_archive,    EX_FLAG_RHS|EX_FLAG_BANG},
     {"ask",              EX_ASK,         ex_assistant,  EX_FLAG_RHS},
     {"assistant",        EX_ASSISTANT,   ex_assistant,  EX_FLAG_RHS},
     {"bma",              EX_BMA,         ex_bookmark,   EX_FLAG_RHS},
@@ -900,7 +900,7 @@ static VbCmdResult ex_lua(Client *c, const ExArg *arg)
  */
 static VbCmdResult ex_archive(Client *c, const ExArg *arg)
 {
-    return archiving_command(c, arg->rhs->str);
+    return archiving_command(c, arg->rhs->str, arg->bang);
 }
 
 static VbCmdResult ex_replay(Client *c, const ExArg *arg)

@@ -3410,6 +3410,7 @@ static gboolean start_mcp(void)
      * site whatever its certificates */
     policy.allow_archive_options = TRUE;
     policy.replay_any            = TRUE;
+    policy.allow_signins         = vb.mcp_allow_signins;
     if (vb.mcp_allow_domains && *vb.mcp_allow_domains) {
         policy.allowed_domains = g_strsplit(vb.mcp_allow_domains, ",", -1);
         for (char **d = policy.allowed_domains; *d; d++) {
@@ -3490,6 +3491,7 @@ int main(int argc, char* argv[])
         {"mcp", 0, 0, G_OPTION_ARG_NONE, &vb.mcp, "Serve the Model Context Protocol on stdin and stdout", NULL},
         {"mcp-http", 0, 0, G_OPTION_ARG_INT, &vb.mcp_http, "Serve the Model Context Protocol over HTTP on 127.0.0.1:PORT", "PORT"},
         {"mcp-allow-eval", 0, 0, G_OPTION_ARG_NONE, &vb.mcp_allow_eval, "Let MCP clients run JavaScript in pages", NULL},
+        {"mcp-allow-signins", 0, 0, G_OPTION_ARG_NONE, &vb.mcp_allow_signins, "Let MCP clients archive signed in, with the archiving sign-ins", NULL},
         {"mcp-allow-domains", 0, 0, G_OPTION_ARG_STRING, &vb.mcp_allow_domains, "The only sites MCP clients may open", "DOMAIN,..."},
         {"bug-info", 0, 0, G_OPTION_ARG_NONE, &buginfo, "Print used library versions", NULL},
         {NULL}

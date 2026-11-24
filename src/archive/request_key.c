@@ -401,3 +401,132 @@ char *archive_request_key(const char *url, const char *method, const char *conte
     g_string_free(spec, TRUE);
     return key;
 }
+
+/* ---- body fields ---------------------------------------------------------- */
+
+#define PROTOBUF_DEPTH_MAX  8
+#define PROTOBUF_LEAVES_MAX 4000
+
+static gboolean read_varint(const guint8 *b, gsize len, gsize *at, guint64 *value)
+{
+    *value = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+        if (*at >= len) {
+            return FALSE;
+        }
+        guint8 byte = b[(*at)++];
+        *value |= (guint64)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static char *hex_of(const guint8 *b, gsize len)
+{
+    GString *s = g_string_sized_new(len * 2);
+    for (gsize i = 0; i < len; i++) {
+        g_string_append_printf(s, "%02X", b[i]);
+    }
+    return g_string_free(s, FALSE);
+}
+
+/* The leaves of bytes read as a protobuf message, or FALSE if they aren't
+ * one: every field well formed, and the message ending where the bytes do.
+ * A length-delimited field is read as a message within it where it is one,
+ * and as its bytes where it isn't. */
+static gboolean protobuf_leaves(const guint8 *b, gsize len, const char *path, int depth,
+        GPtrArray *leaves)
+{
+    gsize at = 0;
+    gboolean any = FALSE;
+    while (at < len) {
+        guint64 tag, value;
+        if (!read_varint(b, len, &at, &tag) || !(tag >> 3) || leaves->len > PROTOBUF_LEAVES_MAX) {
+            return FALSE;
+        }
+        char *name = *path ? g_strdup_printf("%s.%" G_GUINT64_FORMAT, path, tag >> 3)
+            : g_strdup_printf("%" G_GUINT64_FORMAT, tag >> 3);
+        gboolean ok = TRUE;
+        switch (tag & 7) {
+            case 0:
+                ok = read_varint(b, len, &at, &value);
+                if (ok) {
+                    g_ptr_array_add(leaves, g_strdup_printf("%s=%" G_GUINT64_FORMAT, name, value));
+                }
+                break;
+            case 1:
+            case 5: {
+                gsize width = (tag & 7) == 1 ? 8 : 4;
+                ok = len - at >= width;
+                if (ok) {
+                    char *hex = hex_of(b + at, width);
+                    g_ptr_array_add(leaves, g_strdup_printf("%s=%s", name, hex));
+                    g_free(hex);
+                    at += width;
+                }
+                break;
+            }
+            case 2: {
+                ok = read_varint(b, len, &at, &value) && value <= len - at;
+                if (ok) {
+                    const guint8 *inner = b + at;
+                    gsize n = (gsize)value;
+                    at += n;
+                    GPtrArray *nested = g_ptr_array_new_with_free_func(g_free);
+                    if (depth < PROTOBUF_DEPTH_MAX && n
+                            && protobuf_leaves(inner, n, name, depth + 1, nested)) {
+                        for (guint i = 0; i < nested->len; i++) {
+                            g_ptr_array_add(leaves, g_strdup(g_ptr_array_index(nested, i)));
+                        }
+                    } else {
+                        char *hex = hex_of(inner, n);
+                        g_ptr_array_add(leaves, g_strdup_printf("%s=%s", name, hex));
+                        g_free(hex);
+                    }
+                    g_ptr_array_unref(nested);
+                }
+                break;
+            }
+            default:
+                ok = FALSE;
+        }
+        g_free(name);
+        if (!ok) {
+            return FALSE;
+        }
+        any = TRUE;
+    }
+    return any;
+}
+
+char **archive_request_body_fields(const char *body_query)
+{
+    static const char bytes_prefix[] = "__wb_post_data=";
+    GPtrArray *fields = g_ptr_array_new_with_free_func(g_free);
+    if (g_str_has_prefix(body_query, bytes_prefix)) {
+        gsize len;
+        guint8 *bytes = g_base64_decode(body_query + strlen(bytes_prefix), &len);
+        GPtrArray *leaves = g_ptr_array_new_with_free_func(g_free);
+        if (len && protobuf_leaves(bytes, len, "", 0, leaves)) {
+            g_ptr_array_unref(fields);
+            fields = leaves;
+        } else {
+            g_ptr_array_unref(leaves);
+            g_ptr_array_add(fields, g_strdup(body_query));
+        }
+        g_free(bytes);
+    } else {
+        char **terms = g_strsplit(body_query, "&", -1);
+        for (char **t = terms; *t; t++) {
+            if (**t) {
+                g_ptr_array_add(fields, g_strdup(*t));
+            }
+        }
+        g_strfreev(terms);
+    }
+    g_ptr_array_set_free_func(fields, NULL);
+    g_ptr_array_add(fields, NULL);
+    return (char **)g_ptr_array_free(fields, FALSE);
+}

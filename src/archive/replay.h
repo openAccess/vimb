@@ -36,7 +36,9 @@
  * capture is preferred to a nearer part of one (a 206), and for a page, one
  * in which the site let the visitor in to one in which it turned them away
  * (401, 403, 429), as a bot check that reloads once satisfied would
- * otherwise reload for ever.
+ * otherwise reload for ever. A POST or PUT whose body nothing was filed
+ * under is answered by the capture whose body agrees with it most, and a
+ * stream of counted requests (YouTube's video, "rn") in the capture's order.
  *
  * The index is read into memory; the records are read from the archive as
  * they're asked for. Any thread. */

@@ -50,6 +50,9 @@ async def full_run():
         tools = {t.name for t in (await client.list_tools()).tools}
         check("tools listed", "crawl" in tools and "read_page" in tools, ", ".join(sorted(tools)))
         check("no run_javascript without --mcp-allow-eval", "run_javascript" not in tools)
+        start = next(t for t in (await client.list_tools()).tools if t.name == "start_archive")
+        check("no signed_in without --mcp-allow-signins",
+              "signed_in" not in start.input_schema["properties"])
 
         archive = value(await client.call_tool("start_archive",
                                                {"name": "mcp test", "allow_internal": True}))
@@ -131,9 +134,13 @@ async def full_run():
 
 
 async def eval_and_domains():
-    async with Client(server("--mcp-allow-eval", "--mcp-allow-domains", "127.0.0.1")) as client:
-        tools = {t.name for t in (await client.list_tools()).tools}
+    async with Client(server("--mcp-allow-eval", "--mcp-allow-domains", "127.0.0.1",
+                             "--mcp-allow-signins")) as client:
+        listed = (await client.list_tools()).tools
+        tools = {t.name for t in listed}
         check("run_javascript with --mcp-allow-eval", "run_javascript" in tools)
+        start = next(t for t in listed if t.name == "start_archive")
+        check("signed_in with --mcp-allow-signins", "signed_in" in start.input_schema["properties"])
         page = value(await client.call_tool("open_page", {"url": SITE + "index.html"}))
         result = value(await client.call_tool("run_javascript", {
             "tab": page["tab"], "script": "document.querySelectorAll('a').length"}))

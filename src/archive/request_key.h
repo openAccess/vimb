@@ -46,4 +46,13 @@ char *archive_request_key(const char *url, const char *method, const char *conte
 char *archive_request_body_query(const char *content_type, const guint8 *body,
         gsize body_len, gboolean whole);
 
+/* The fields of a body query -- what archive_request_body_query() made, or
+ * an index recorded -- each as "name=value", for telling bodies apart field
+ * by field: a form's or a JSON body's fields; for one kept as bytes
+ * ("__wb_post_data="), its leaves read as protobuf where it is protobuf --
+ * YouTube asks for its video so, saying where the player is and what it has
+ * buffered -- each named by the path of field numbers to it, "1.38.4.1=249";
+ * anything else, the one field it is. NULL-terminated, the caller's. */
+char **archive_request_body_fields(const char *body_query);
+
 #endif /* end of include guard: _ARCHIVE_REQUEST_KEY_H */

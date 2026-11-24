@@ -40,6 +40,11 @@ typedef struct {
      * websocket's messages), its block in response, of content_type. */
     char      *record_type;
     char      *content_type;
+    /* Credentials recorded as "[redacted]": Cookie and Authorization in the
+     * request, whose head is request_head_length long; Set-Cookie in the
+     * response. */
+    gboolean  redact;
+    guint64   request_head_length;
 } ArchiveExchange;
 
 ArchiveExchange *archive_exchange_new(void);

@@ -1383,6 +1383,203 @@ static void test_replay(void)
     g_free(dir);
 }
 
+/* A POST, its body bytes, and its Content-Length. */
+static char *post_of(const char *path, const char *host, const char *type, const guint8 *body,
+        gsize len)
+{
+    char *head = g_strdup_printf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: %s\r\n"
+            "Content-Length: %" G_GSIZE_FORMAT "\r\n\r\n", path, host, type, len);
+    char *text = g_strconcat(head, NULL);
+    gsize n = strlen(head);
+    text = g_realloc(text, n + len + 1);
+    memcpy(text + n, body, len);
+    text[n + len] = '\0';
+    g_free(head);
+    return text;
+}
+
+/* A protobuf body, as a player sends one: no zero bytes, so a string. */
+static char *protobuf_of(guint position, const char *tag)
+{
+    return g_strdup_printf("\x08\x05\x12%c%s\x18%c", (char)strlen(tag), tag, (char)position);
+}
+
+static char *player_body(const char *video)
+{
+    char *pad = g_strnfill(5000, 'x');
+    char *body = g_strdup_printf("{\"context\": {\"pad\": \"%s\"}, \"videoId\": \"%s\"}", pad, video);
+    g_free(pad);
+    return body;
+}
+
+static char *ask_post(ArchiveReplay *replay, const char *url, const char *type,
+        const char *body, gboolean *found)
+{
+    const char *path = strchr(strstr(url, "//") + 2, '/');
+    char *host = g_strndup(strstr(url, "//") + 2, path - (strstr(url, "//") + 2));
+    char *request = post_of(path, host, type, (const guint8 *)body, strlen(body));
+    char *a = ask(replay, url, request, found);
+    g_free(request);
+    g_free(host);
+    return a;
+}
+
+/* What a page POSTs that differs from what it POSTed when captured: found
+ * by what of the body agrees -- all of the body, where the key holds only
+ * its start -- or, for a stream of counted requests, in the capture's order. */
+static void test_replay_bodies(void)
+{
+    char *dir     = make_temp_dir();
+    char *capture = g_build_filename(dir, "capture", NULL);
+    char *wacz    = g_build_filename(dir, "bodies.wacz", NULL);
+    GError *error = NULL;
+    g_mkdir(capture, 0700);
+
+    /* protobuf leaves, named by their field numbers */
+    char *pb = protobuf_of(30, "abc");
+    char *b64 = g_base64_encode((const guchar *)pb, strlen(pb));
+    char *query = g_strconcat("__wb_post_data=", b64, NULL);
+    char **fields = archive_request_body_fields(query);
+    char *joined = g_strjoinv(" ", fields);
+    g_assert_cmpstr(joined, ==, "1=5 2=616263 3=30");
+    g_free(joined);
+    g_strfreev(fields);
+    g_free(query);
+    g_free(b64);
+    g_free(pb);
+    fields = archive_request_body_fields("q=a%20cat&n=2");
+    g_assert_cmpuint(g_strv_length(fields), ==, 2);
+    g_strfreev(fields);
+
+    char *warc = g_build_filename(capture, "data.warc.gz", NULL);
+    WarcWriter *w = warc_writer_open(warc, "test", NULL);
+    /* two videos asked for by bodies alike for longer than a key holds */
+    const char *player = "https://www.youtube.com/youtubei/v1/player";
+    for (int i = 0; i < 2; i++) {
+        char *body = player_body(i ? "BBBBBBBBBBB" : "AAAAAAAAAAA");
+        char *req  = post_of("/youtubei/v1/player", "www.youtube.com", "application/json",
+                (const guint8 *)body, strlen(body));
+        write_at(w, capture, player, req, i
+                ? "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nplayer B"
+                : "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nplayer A", 2, 12 + i);
+        g_free(req);
+        g_free(body);
+    }
+    /* a stream: a request counted ("rn"), with an id the player made up
+     * ("cpn"), and what it has buffered in its body */
+    for (int rn = 1; rn <= 3; rn++) {
+        char *path = g_strdup_printf("/videoplayback?id=v1&cpn=CPNcaptured12&rn=%d", rn);
+        char *url  = g_strconcat("https://rr1.googlevideo.com", path, NULL);
+        char *body = protobuf_of(10 * rn, "buf");
+        char *req  = post_of(path, "rr1.googlevideo.com", "application/x-protobuf",
+                (const guint8 *)body, strlen(body));
+        char *resp = g_strdup_printf("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nseg%d", rn);
+        write_at(w, capture, url, req, resp, 2, 12);
+        g_free(resp);
+        g_free(req);
+        g_free(body);
+        g_free(url);
+        g_free(path);
+    }
+    /* and another video's */
+    for (int rn = 1; rn <= 2; rn++) {
+        char *path = g_strdup_printf("/videoplayback?id=v2&cpn=CPNcaptured34&rn=%d", rn);
+        char *url  = g_strconcat("https://rr1.googlevideo.com", path, NULL);
+        char *body = protobuf_of(10 * rn, "buf");
+        char *req  = post_of(path, "rr1.googlevideo.com", "application/x-protobuf",
+                (const guint8 *)body, strlen(body));
+        char *resp = g_strdup_printf("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nv2s%d", rn);
+        write_at(w, capture, url, req, resp, 2, 12);
+        g_free(resp);
+        g_free(req);
+        g_free(body);
+        g_free(url);
+        g_free(path);
+    }
+    /* two reports, one field telling them apart */
+    for (int i = 0; i < 2; i++) {
+        char *body = g_strdup_printf("\x08%c\x12\x03" "abc", 7 + i);
+        char *req  = post_of("/log", "www.youtube.com", "application/x-protobuf",
+                (const guint8 *)body, strlen(body));
+        write_at(w, capture, "https://www.youtube.com/log", req, i
+                ? "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlogY"
+                : "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlogX", 2, 12);
+        g_free(req);
+        g_free(body);
+    }
+    g_assert_true(warc_writer_close(w, NULL));
+    char *pages = g_build_filename(capture, ARCHIVE_PAGES_FILE, NULL);
+    char *line  = archive_page_line("https://www.youtube.com/", "2026-01-02T12:00:00Z", "Video");
+    char *text  = g_strdup_printf("%s\n%s\n", ARCHIVE_PAGES_HEADER, line);
+    g_file_set_contents(pages, text, -1, NULL);
+    g_free(text);
+    g_free(line);
+    g_assert_true(archive_wacz_package(capture, wacz, "test", "Bodies", TRUE, &error));
+    g_assert_no_error(error);
+    ArchiveReplay *replay = archive_replay_open(wacz, &error);
+    g_assert_no_error(error);
+
+    gboolean found;
+    /* the video named after where the key is cut */
+    for (int i = 0; i < 2; i++) {
+        char *body = player_body(i ? "BBBBBBBBBBB" : "AAAAAAAAAAA");
+        char *a = ask_post(replay, player, "application/json", body, &found);
+        g_assert_true(found);
+        g_assert_cmpstr(body_of(a), ==, i ? "player B" : "player A");
+        g_free(a);
+        g_free(body);
+    }
+
+    /* the stream, asked by another player -- its own cpn, its own buffer --
+     * in order; then nothing; then from the start again */
+    const char *expected[] = {"seg1", "seg2", "seg3", NULL, "seg1"};
+    const int counts[] = {1, 2, 3, 4, 1};
+    for (gsize i = 0; i < G_N_ELEMENTS(counts); i++) {
+        char *url  = g_strdup_printf("https://rr1.googlevideo.com/videoplayback?id=v1"
+                "&cpn=CPNreplayed99&rn=%d", counts[i]);
+        char *body = protobuf_of(7 * counts[i] + 1, "other");
+        char *a = ask_post(replay, url, "application/x-protobuf", body, &found);
+        if (expected[i]) {
+            g_assert_true(found);
+            g_assert_cmpstr(body_of(a), ==, expected[i]);
+        } else {
+            g_assert_false(found);
+        }
+        g_free(a);
+        g_free(body);
+        g_free(url);
+    }
+    /* another video's stream is its own */
+    char *body = protobuf_of(11, "buf");
+    char *a = ask_post(replay, "https://rr1.googlevideo.com/videoplayback?id=v2&cpn=CPNx&rn=1",
+            "application/x-protobuf", body, &found);
+    g_assert_true(found);
+    g_assert_cmpstr(body_of(a), ==, "v2s1");
+    g_free(a);
+    g_free(body);
+
+    /* the report agreeing most, field by field; none, agreeing in nothing */
+    body = g_strdup("\x08\x08\x12\x03" "abc\x18\x63");
+    a = ask_post(replay, "https://www.youtube.com/log", "application/x-protobuf", body, &found);
+    g_assert_true(found);
+    g_assert_cmpstr(body_of(a), ==, "logY");
+    g_free(a);
+    g_free(body);
+    body = g_strdup("\x08\x09\x12\x03zzz");
+    a = ask_post(replay, "https://www.youtube.com/log", "application/x-protobuf", body, &found);
+    g_assert_false(found);
+    g_free(a);
+    g_free(body);
+
+    archive_replay_free(replay);
+    remove_tree(dir);
+    g_free(pages);
+    g_free(warc);
+    g_free(wacz);
+    g_free(capture);
+    g_free(dir);
+}
+
 /* ---- websockets ---------------------------------------------------------- */
 
 typedef struct {
@@ -1504,6 +1701,7 @@ int main(int argc, char *argv[])
     g_test_add_func("/archive/proxy/records-as-received", test_proxy_records_as_received);
     g_test_add_func("/archive/surt", test_surt);
     g_test_add_func("/archive/replay", test_replay);
+    g_test_add_func("/archive/replay/bodies", test_replay_bodies);
     g_test_add_func("/archive/websocket", test_websocket);
     g_test_add_func("/archive/request-key", test_request_key);
     g_test_add_func("/archive/index", test_index);

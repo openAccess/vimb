@@ -481,8 +481,9 @@ static void tool_start_archive(Call *call)
         internal = arg_present(call, "allow_internal")
             ? arg_boolean(call, "allow_internal", FALSE) : -1;
     }
-    struct Archive *a = c ? archiving_create(c, arg_string(call, "name"), verify, internal, &error)
-        : NULL;
+    gboolean signed_in = call->policy->allow_signins && arg_boolean(call, "signed_in", FALSE);
+    struct Archive *a = c ? archiving_create(c, arg_string(call, "name"), verify, internal,
+            signed_in, &error) : NULL;
     if (!a) {
         call_fail(call, "%s", error ? error->message : "no tab to start from");
         g_clear_error(&error);
@@ -769,7 +770,10 @@ static const Tool tools[] = {
     {"start_archive", "Start a web archive (a WACZ). Pages are archived by opening them with it "
         "(open_page with archive) or crawling (crawl). It is saved by stop_archive.",
         "{\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, "
-        "\"strict_ssl\": {\"type\": \"boolean\"}, \"allow_internal\": {\"type\": \"boolean\"}}}",
+        "\"strict_ssl\": {\"type\": \"boolean\"}, \"allow_internal\": {\"type\": \"boolean\"}, "
+        "\"signed_in\": {\"type\": \"boolean\", \"description\": \"Start with the cookies of the "
+        "sites the person signed in to for archiving (:archive signin), to archive what they "
+        "see signed in. Only when the person asks for it.\"}}}",
         tool_start_archive, FALSE},
     {"archive_status", "How an archive stands: recording, paused, saving or done; how many "
         "responses it holds; where it was saved.",
@@ -833,6 +837,11 @@ JsonNode *tools_list(const ToolPolicy *policy)
                     "properties");
             json_object_remove_member(props, "strict_ssl");
             json_object_remove_member(props, "allow_internal");
+        }
+        if (!policy->allow_signins && JSON_NODE_HOLDS_OBJECT(schema)
+                && !strcmp(tools[i].name, "start_archive")) {
+            json_object_remove_member(json_object_get_object_member(json_node_get_object(schema),
+                        "properties"), "signed_in");
         }
         json_object_set_member(o, "inputSchema", schema);
         json_array_add_object_element(list, o);

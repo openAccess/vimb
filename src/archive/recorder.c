@@ -17,8 +17,12 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
+#include <string.h>
+
 #include "recorder.h"
 #include "warc.h"
+
+#define SPOOL_MEMORY_LIMIT (1 << 20)
 
 /* Payloads smaller than this aren't worth a revisit, whose head is as big. */
 #define REVISIT_MIN 512
@@ -89,17 +93,104 @@ static gboolean copy_head(const guint8 *data, gsize len, gpointer user_data, GEr
     return copy->left > 0;          /* stopped, once it has it all */
 }
 
-/* The response's head alone, as a revisit holds it; NULL if it can't be had. */
-static Spool *head_of(ArchiveExchange *exchange)
+/* The first length bytes of a spool; NULL if it hasn't that many. */
+static Spool *head_bytes(Spool *spool, guint64 length)
 {
-    HeadCopy copy = {spool_new(g_get_tmp_dir(), (gsize)exchange->head_length + 1),
-        exchange->head_length};
-    spool_foreach(exchange->response, copy_head, &copy, NULL);
+    HeadCopy copy = {spool_new(g_get_tmp_dir(), (gsize)length + 1), length};
+    spool_foreach(spool, copy_head, &copy, NULL);
     if (copy.left) {
         spool_free(copy.head);
         return NULL;
     }
     return copy.head;
+}
+
+/* The response's head alone, as a revisit holds it; NULL if it can't be had. */
+static Spool *head_of(ArchiveExchange *exchange)
+{
+    return head_bytes(exchange->response, exchange->head_length);
+}
+
+typedef struct {
+    Spool   *to;
+    guint64 skip;
+} Tail;
+
+static gboolean copy_tail(const guint8 *data, gsize len, gpointer user_data, GError **error)
+{
+    Tail *t = user_data;
+    gsize skipped = (gsize)MIN((guint64)len, t->skip);
+    t->skip -= skipped;
+    return len == skipped || spool_append(t->to, data + skipped, len - skipped, error);
+}
+
+/* A message whose head names any of names gets them as "[redacted]": a new
+ * spool, or NULL to keep the one it has. */
+static Spool *redacted(Spool *message, guint64 head_length, const char **names)
+{
+    Spool *head = head_length ? head_bytes(message, head_length) : NULL;
+    GBytes *bytes = head ? spool_get_bytes(head, (gsize)head_length + 1, NULL) : NULL;
+    spool_free(head);
+    if (!bytes) {
+        return NULL;
+    }
+    gsize size;
+    const char *text = g_bytes_get_data(bytes, &size);
+    char *copy = g_strndup(text, size);
+    g_bytes_unref(bytes);
+    char **lines = g_strsplit(copy, "\r\n", -1);
+    GString *out = g_string_new(NULL);
+    gboolean changed = FALSE;
+    for (int i = 0; lines[i]; i++) {
+        const char *colon = i ? strchr(lines[i], ':') : NULL;
+        gboolean secret = FALSE;
+        for (int n = 0; colon && names[n] && !secret; n++) {
+            secret = (gsize)(colon - lines[i]) == strlen(names[n])
+                && !g_ascii_strncasecmp(lines[i], names[n], colon - lines[i]);
+        }
+        if (secret) {
+            g_string_append_len(out, lines[i], colon - lines[i] + 1);
+            g_string_append(out, " [redacted]");
+            changed = TRUE;
+        } else {
+            g_string_append(out, lines[i]);
+        }
+        if (lines[i + 1]) {
+            g_string_append(out, "\r\n");
+        }
+    }
+    g_strfreev(lines);
+    g_free(copy);
+    Spool *result = NULL;
+    if (changed) {
+        result = spool_new(g_get_tmp_dir(), SPOOL_MEMORY_LIMIT);
+        Tail tail = {result, head_length};
+        if (!spool_append(result, out->str, out->len, NULL)
+                || !spool_foreach(message, copy_tail, &tail, NULL)) {
+            spool_free(result);
+            result = NULL;
+        }
+    }
+    g_string_free(out, TRUE);
+    return result;
+}
+
+static const char *request_secrets[]  = {"Cookie", "Authorization", NULL};
+static const char *response_secrets[] = {"Set-Cookie", "Set-Cookie2", NULL};
+
+/* An exchange of an archive made signed in, its credentials taken out. */
+static void redact(ArchiveExchange *exchange)
+{
+    Spool *request  = redacted(exchange->request, exchange->request_head_length, request_secrets);
+    Spool *response = redacted(exchange->response, exchange->head_length, response_secrets);
+    if (request) {
+        spool_free(exchange->request);
+        exchange->request = request;
+    }
+    if (response) {
+        spool_free(exchange->response);
+        exchange->response = response;
+    }
 }
 
 static gboolean dedupable(const ArchiveExchange *exchange)
@@ -140,6 +231,9 @@ static void write_exchange(ArchiveRecorder *recorder, ArchiveExchange *exchange)
     if (exchange->record_type) {
         write_record(recorder, exchange);
         return;
+    }
+    if (exchange->redact) {
+        redact(exchange);
     }
     Original *original = dedupable(exchange)
         ? g_hash_table_lookup(recorder->originals, exchange->payload_digest) : NULL;

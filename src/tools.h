@@ -48,6 +48,7 @@ typedef struct {
     ToolApprove  approve_lua;           /* run_lua, and who lets a script run; NULL: none */
     ToolLearn    learn;                 /* told what scripts read from pages; NULL: nobody */
     gboolean     replay_any;            /* replay_archive any WACZ, not only this run's */
+    gboolean     allow_signins;         /* start_archive signed_in: with the sign-ins' cookies */
     gpointer     url_check_data;        /* for the callbacks */
 } ToolPolicy;
 

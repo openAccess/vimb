@@ -118,6 +118,10 @@ what the assistant said.
 Stop after \fISECONDS\fP: what the assistant is doing stops, what was archived
 is saved, and vimb quits with status 2.
 .TP
+.B "\-\-mcp-allow-signins"
+Let MCP clients start archives signed in (\fBsigned_in\fP), with the
+archiving sign-ins.
+.TP
 .BI "\-\-window-size " WIDTHxHEIGHT
 Open the window this size, and don't maximize it.
 What a page lays out, and so what it loads, depends on the size it is shown
@@ -734,11 +738,16 @@ is kept as a revisit, which says where that content is, rather than twice;
 and a websocket's messages are kept, each with when it came.
 The status bar of an archiving tab shows `[REC name]'.
 .TP
-.BI ":archive [" name ]
+.BI ":archive[!] [" name ]
 .TQ
-.BI ":archive start [" name ]
+.BI ":archive[!] start [" name ]
 Open the current page in a new archiving tab, archiving as \fIname\fP (by
 default `Archive' and the date and time).
+With the \fB!\fP, the archive starts signed in: with the cookies of the
+sites signed in to for archiving (see \fB:archive signin\fP), and nothing
+else of them.
+Cookies and credentials are then recorded as `[redacted]', so that the
+archive doesn't keep the session.
 .TP
 .B ":archive pause"
 .TQ
@@ -757,6 +766,14 @@ Show, or change, the name of the archive.
 .TP
 .B ":archive status"
 Show whether the archive is recording, and how many responses it holds.
+.TP
+.BI ":archive signin [" url ]
+Open a tab in the sign-ins: a profile of their own, kept apart from the rest
+of vimb's, where sites are signed in to for archiving them signed in.
+vimb never sees a password; you sign in on the site, in the tab.
+.TP
+.B ":archive signins [clear]"
+Show the sites signed in to for archiving, or sign out of them all.
 .PP
 These commands act on the archive of the current tab, or on the one archive
 being recorded.
@@ -774,6 +791,11 @@ was then; and the page's clock reads as it did then.
 What a page asks for anew each visit \(em with a reading of the clock in its
 address, or a random number, or an id made for the visit \(em is answered by
 what it was asked as when archived.
+A POST that sends something other than it sent then \(em as a video player
+does, saying where it is and what it has buffered \(em is answered by the
+capture whose body agrees with it most, field by field; and requests a player
+counts, one after another, as YouTube's do, are answered in the order they
+were archived.
 A websocket is answered with the messages it carried, the page's own waited
 for as they were.
 The status bar of a replaying tab shows `[REPLAY name]', and
@@ -815,7 +837,14 @@ The current tab; all tabs.
 Open \fIurl\fP in a new tab, not archived; returns the tab and what loaded:
 {url, status, title}.
 .TP
-.BI vimb.archive.start([ name " | {name=, strict_ssl=, allow_internal=}])"
+.BI vimb.signin([ url ])
+Open a tab in the sign-ins (see \fB:archive signin\fP); returns the tab and
+what loaded.
+.TP
+.BI vimb.ex( command )
+Run an ex command, as typed after `:'; returns whether it succeeded.
+.TP
+.BI vimb.archive.start([ name " | {name=, strict_ssl=, allow_internal=, signed_in=}])"
 Start an archive (see \fBArchiving\fP), without a tab; it is saved when the
 script stops it, or when vimb quits.
 .PP
@@ -955,7 +984,7 @@ With \fB\-\-mcp-allow-eval\fP only: {value}.
 .TP
 .BR close_tab " {tab}"
 .TP
-.BR start_archive " {name, strict_ssl, allow_internal}"
+.BR start_archive " {name, strict_ssl, allow_internal, signed_in}"
 {archive, name, state, responses}.
 .TP
 .BR archive_status " {archive}"
@@ -1536,6 +1565,10 @@ Read when the assistant starts, or after \fB:assistant clear\fP.
 .B assistant-effort (string)
 How hard the assistant thinks: `low', `medium' (the default), `high',
 `xhigh' or `max'.
+.TP
+.B assistant-signins (bool)
+Whether the assistant may start archives signed in, with the archiving
+sign-ins, when asked to. Off by default.
 .TP
 .B assistant-model (string)
 The model, if not the default: for `claude', claude-opus-5-5; for `gemini',

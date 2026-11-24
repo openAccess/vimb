@@ -72,6 +72,10 @@ typedef struct {
      * nothing is fetched or recorded -- the network isn't touched at all.
      * It must last as long as the proxy. */
     ArchiveReplay         *replay;
+    /* Cookies and credentials -- Cookie, Authorization, Set-Cookie -- are
+     * recorded as "[redacted]": for an archive made signed in, which would
+     * otherwise keep the person's session in it. */
+    gboolean              redact_credentials;
 } ArchiveProxyOptions;
 
 ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **error);

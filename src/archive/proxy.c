@@ -55,6 +55,7 @@ struct ArchiveProxy {
     GMainContext          *owner_context;
     ArchiveReplay         *replay;          /* answers everything, in replay */
     GPtrArray             *websockets;      /* under lock: the WsRecordings open */
+    gboolean              redact;           /* credentials, in what is recorded */
 
     ArchiveCa             *ca;
     ArchiveRecorder       *recorder;        /* under lock; NULL once finished */
@@ -1205,6 +1206,8 @@ static gboolean serve_request(Conn *conn, Http1Parser *request, GByteArray *body
             exchange->ip_address = g_strdup(conn->up_ip);
             exchange->date       = g_date_time_new_now_utc();
             exchange->request    = spool_new(proxy->tmp_dir, SPOOL_MEMORY);
+            exchange->redact     = proxy->redact;
+            exchange->request_head_length = out->len;
             spool_append(exchange->request, out->str, out->len, NULL);
             spool_append(exchange->request, body->data, body->len, NULL);
         }
@@ -1544,6 +1547,7 @@ ArchiveProxy *archive_proxy_start(const ArchiveProxyOptions *options, GError **e
     proxy->allow_certificate = options->allow_certificate;
     proxy->allow_data        = options->allow_data;
     proxy->replay            = options->replay;
+    proxy->redact            = options->redact_credentials;
     proxy->owner_context     = g_main_context_ref(options->owner_context
             ? options->owner_context : g_main_context_default());
     proxy->hosts             = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);

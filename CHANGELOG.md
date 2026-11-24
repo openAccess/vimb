@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   other tools'; answers what a page asks for anew each visit -- cache
   busters, clock readings, ids made for the visit -- with what was archived;
   plays websockets back; and sets a replayed page's clock to its capture's.
+* Replay answers a POST that differs from what was archived -- as a player
+  asks for video, saying where it is and what it has buffered -- with the
+  capture whose body agrees most, field by field (protobuf bodies read
+  leaf by leaf), and a stream of counted requests (YouTube's SABR `rn`) in
+  the order it was archived, whatever id the player makes up for itself.
+* Archiving signed in: `:archive signin [URL]` opens a tab in a profile of
+  its own for signing in to sites; `:archive!` starts an archive with its
+  cookies, recording cookies and credentials as `[redacted]`;
+  `:archive signins [clear]` lists or clears them. Also `vimb.signin()`,
+  `vimb.ex()`, `signed_in` for scripts, MCP (`--mcp-allow-signins`) and the
+  assistant (`:set assistant-signins`).
 * Unattended runs: `--assistant-task-file FILE`, `--summary FILE` (what
   the run came to, as JSON), and `--timeout SECONDS` (stop, save, exit 2).
   `contrib/container` builds an image that runs vimb under Xvfb for an

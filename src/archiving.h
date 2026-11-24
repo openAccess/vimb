@@ -36,7 +36,9 @@
  * there the next time it starts. */
 
 /* :archive [start [name] | pause | resume | stop | name NAME | status | NAME] */
-VbCmdResult archiving_command(Client *c, const char *args);
+/* :archive[!] ...; with the bang, an archive is started signed in (see the
+ * man page). */
+VbCmdResult archiving_command(Client *c, const char *args, gboolean bang);
 
 /* The network session an archive's tabs use. */
 WebKitNetworkSession *archiving_session(struct Archive *archive);
@@ -60,7 +62,7 @@ const char *archiving_status(Client *c);
  * closes, and stopped with a callback once it is saved. verify and
  * allow_internal are -1 to follow strict-ssl and archive-allow-internal. */
 struct Archive *archiving_create(Client *c, const char *name, int verify, int allow_internal,
-        GError **error);
+        gboolean signed_in, GError **error);
 gboolean archiving_alive(struct Archive *archive);
 void archiving_hold(struct Archive *archive);
 void archiving_release(struct Archive *archive);
@@ -87,6 +89,10 @@ void archiving_replay_clock(Client *c, const char *url, const char *referer);
 struct Archive *archiving_replay_open(Client *c, const char *path, GError **error);
 const char *archiving_replay_landing(struct Archive *archive);
 gboolean archiving_replay_counts(struct Archive *archive, guint *served, guint *missed);
+
+/* The sign-ins, to open a tab in with vb_tab_new_archive(): where the
+ * person signs in to sites for archiving (see :archive signin). */
+struct Archive *archiving_signins(void);
 
 /* Packages any capture a crash left behind, in the background. */
 void archiving_recover(Client *c);

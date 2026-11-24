@@ -26,6 +26,7 @@
 
 #include "archiving.h"
 #include "crawl.h"
+#include "ex.h"
 #include "luascript.h"
 #include "main.h"
 #include "ops.h"
@@ -577,6 +578,27 @@ static int l_replay(lua_State *co)
     return open_in(co, c, url ? url : archiving_replay_landing(a), 3);
 }
 
+/* vimb.signin([url [, {timeout=}]]) -> tab, info -- a tab in the sign-ins,
+ * where sites are signed in to for archiving */
+static int l_signin(lua_State *co)
+{
+    const char *url = luaL_optstring(co, 1, "about:blank");
+    deny_sandboxed(co, "vimb.signin");
+    can_wait(co);
+    Client *c = vb_tab_new_archive(archiving_signins(), NULL);
+    return open_in(co, c, url, 2);
+}
+
+/* vimb.ex(command) -> ok -- runs an ex command, as typed after ":" */
+static int l_ex(lua_State *co)
+{
+    const char *command = luaL_checkstring(co, 1);
+    deny_sandboxed(co, "vimb.ex");
+    Client *c = vb_get_current_client();
+    lua_pushboolean(co, c && (ex_run_string(c, command, false) & CMD_SUCCESS));
+    return 1;
+}
+
 /* vimb.archive.start([name | {name=, strict_ssl=, allow_internal=}]) */
 static int l_archive_start(lua_State *co)
 {
@@ -592,7 +614,8 @@ static int l_archive_start(lua_State *co)
     /* a sandboxed script's archive follows the settings, whatever it asks */
     gboolean own  = s && !s->sandboxed;
     struct Archive *a = c ? archiving_create(c, name, own ? opt_tristate(co, 1, "strict_ssl") : -1,
-            own ? opt_tristate(co, 1, "allow_internal") : -1, &error) : NULL;
+            own ? opt_tristate(co, 1, "allow_internal") : -1,
+            own && opt_boolean(co, 1, "signed_in", FALSE), &error) : NULL;
     if (!a) {
         lua_pushnil(co);
         lua_pushstring(co, error ? error->message : "no tab to start from");
@@ -1009,7 +1032,8 @@ static void add_vimb(lua_State *state)
     };
     static const luaL_Reg vimb_functions[] = {
         {"log", l_log}, {"sleep", l_sleep}, {"quit", l_quit}, {"tab", l_tab},
-        {"tabs", l_tabs}, {"open", l_open}, {"replay", l_replay}, {NULL, NULL}
+        {"tabs", l_tabs}, {"open", l_open}, {"replay", l_replay}, {"signin", l_signin},
+        {"ex", l_ex}, {NULL, NULL}
     };
 
     new_class(state, TAB_META, tab_methods, l_tab_index, NULL);
